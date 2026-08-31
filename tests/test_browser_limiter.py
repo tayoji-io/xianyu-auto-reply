@@ -98,6 +98,132 @@ async def test_never_exceeds_limit_under_concurrency(limiter, monkeypatch):
     assert not active
 
 
+@pytest.mark.anyio
+async def test_release_does_not_delete_slot_reacquired_by_someone_else(limiter):
+    """release 必须是“比较后删”，不能是无条件 delete。
+
+    背景（2026-08-31 代码审查 Finding 1）：fakeredis 2.37.1 的 WATCH 不检测
+    “另一个连接改了被 watch 的 key”，所以没法在 fakeredis 上用真正的并发去
+    触发 WatchError；但“比较值再决定要不要删”这一步本身，可以用串行操作
+    验证——手动把 slot key 的值改写成别人的 token，再释放原 token，断言这个
+    key 没有被删掉。如果 release_browser_slot 被改成无条件 delete，这里会失败
+    （已手动验证：把实现换成 `await r.delete(key)` 后，本测试会因为 key 被
+    删掉而失败）。
+
+    WATCH 本身在真正并发场景下会不会正确拦截误删，这条结论无法在 fakeredis
+    上验证，已经用真实 Redis 单独跑过对比实验确认可靠（见审查结论 /
+    task-4-report.md）。
+    """
+    t1 = await limiter.acquire_browser_slot(timeout=1)
+    r = limiter._get_redis()
+    index_str, _, _ = t1.partition(":")
+    key = f"xianyu:browser:slot:{index_str}"
+
+    # 模拟：t1 的 slot 已经因为 TTL 到期被另一个进程重新抢到
+    await r.set(key, "someone-else-token")
+
+    await limiter.release_browser_slot(t1)
+
+    assert await r.get(key) == "someone-else-token"
+
+
+@pytest.mark.anyio
+async def test_release_logs_and_swallows_watch_error(limiter, monkeypatch):
+    """release 遇到 WatchError（并发覆盖）时应该吞掉异常、不删除、不向上抛。
+
+    fakeredis 不会真的触发 WatchError（见上一个测试的说明），这里用一层包装
+    直接在 pipeline.execute() 上人为抛出 WatchError，只测试“遇到 WatchError
+    该怎么处理”这段代码本身的逻辑，不测试 WATCH 的并发检测能力。
+    """
+    from redis.exceptions import WatchError
+
+    class _RaisingPipeline:
+        def __init__(self, real_pipe):
+            self._real_pipe = real_pipe
+
+        async def __aenter__(self):
+            await self._real_pipe.__aenter__()
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return await self._real_pipe.__aexit__(*exc_info)
+
+        def __getattr__(self, name):
+            return getattr(self._real_pipe, name)
+
+        async def execute(self, *args, **kwargs):
+            raise WatchError("模拟并发覆盖：fakeredis 无法真实触发，这里手工模拟")
+
+    real_redis = limiter._get_redis()
+    t1 = await limiter.acquire_browser_slot(timeout=1)
+    index_str, _, _ = t1.partition(":")
+    key = f"xianyu:browser:slot:{index_str}"
+
+    original_pipeline = real_redis.pipeline
+
+    def fake_pipeline(*args, **kwargs):
+        return _RaisingPipeline(original_pipeline(*args, **kwargs))
+
+    monkeypatch.setattr(real_redis, "pipeline", fake_pipeline)
+
+    await limiter.release_browser_slot(t1)  # 不应向上抛异常
+
+    monkeypatch.setattr(real_redis, "pipeline", original_pipeline)
+    # WatchError 分支放弃删除，key 应该还在
+    assert await real_redis.get(key) == t1.partition(":")[2]
+
+
+@pytest.mark.anyio
+async def test_renew_slot_extends_ttl_when_owner(limiter):
+    """_renew_slot 在 value 仍是自己的情况下应该把 TTL 续回 _SLOT_TTL_SECONDS。"""
+    t1 = await limiter.acquire_browser_slot(timeout=1)
+    r = limiter._get_redis()
+    index_str, _, _ = t1.partition(":")
+    key = f"xianyu:browser:slot:{index_str}"
+
+    await r.expire(key, 1)  # 模拟快到期
+    ok = await limiter._renew_slot(t1)
+    assert ok is True
+    ttl = await r.ttl(key)
+    assert ttl > 1  # 已经被续回接近 _SLOT_TTL_SECONDS
+
+
+@pytest.mark.anyio
+async def test_renew_slot_returns_false_when_not_owner(limiter):
+    """_renew_slot 发现 value 不匹配时应该返回 False，且不动 TTL。"""
+    r = limiter._get_redis()
+    key = "xianyu:browser:slot:0"
+    await r.set(key, "someone-else-token", ex=5)
+
+    ok = await limiter._renew_slot("0:not-the-owner-token")
+
+    assert ok is False
+    ttl = await r.ttl(key)
+    assert 0 < ttl <= 5  # 未被续期覆盖成新的完整 TTL
+
+
+@pytest.mark.anyio
+async def test_browser_slot_renews_ttl_while_held(limiter, monkeypatch):
+    """browser_slot 持有期间应该定期续期，长任务不会被提前回收（审查 Finding 2）。
+
+    把 TTL 和续期间隔都调小，故意持有超过原始 TTL 的时间：如果没有心跳续期，
+    slot key 会在原始 TTL 后被 Redis 自动删除；有心跳续期的话，key 应该始终存在，
+    直到退出 context 后才被释放。
+    """
+    monkeypatch.setattr(limiter, "_SLOT_TTL_SECONDS", 1)
+    monkeypatch.setattr(limiter, "_RENEW_INTERVAL_SECONDS", 0.3)
+
+    async with limiter.browser_slot(timeout=1) as token:
+        r = limiter._get_redis()
+        index_str, _, _ = token.partition(":")
+        key = f"xianyu:browser:slot:{index_str}"
+
+        await asyncio.sleep(1.5)  # 超过原始 TTL（1s），依赖心跳续期才能存活
+        assert await r.exists(key) == 1
+
+    assert await r.exists(key) == 0  # 退出 context 后应已释放
+
+
 @pytest.fixture()
 def anyio_backend():
     return "asyncio"
