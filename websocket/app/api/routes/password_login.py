@@ -114,6 +114,14 @@ def _run_password_login_sync(
     global_browser_slot()，这里不需要重复获取；这个临时事件循环存在的
     唯一目的，就是让该槽位的心跳续期协程有地方跑，不会被这段同步代码
     卡住整个 90 秒 TTL 窗口。
+
+    重要：run_browser_task 可能在 _run_password_login_core 还没开始执行前就
+    抛出异常（典型如等待全局浏览器并发槽位超时 BrowserSlotTimeout——人脸验证
+    等待、批量发布复用浏览器等场景会让槽位被占用远超默认 120s 超时）。这种
+    异常发生时 _run_password_login_core 自身的 try/except/finally 完全没有
+    机会执行，因此下面必须单独兜底，否则 session 状态会永远停在 'processing'
+    （前端一直轮询到 1 小时会话清理），且该账号会因 password_login_state 未
+    调用 finish_processing 而在 5 分钟 PROCESSING_TIMEOUT 内无法重新发起登录。
     """
     # 检查账号是否已禁用：提前返回，避免白白等待浏览器并发槽位
     from app.services.captcha.concurrency import should_skip_account, run_browser_task
@@ -128,10 +136,26 @@ def _run_password_login_sync(
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-    asyncio.run(run_browser_task(
-        _run_password_login_core,
-        session_id, account_id, account, password, show_browser, user_id,
-    ))
+    try:
+        asyncio.run(run_browser_task(
+            _run_password_login_core,
+            session_id, account_id, account, password, show_browser, user_id,
+        ))
+    except Exception as e:
+        # 走到这里说明异常发生在 _run_password_login_core 自身的
+        # try/except/finally 覆盖范围之外（最典型：BrowserSlotTimeout），
+        # 需要补齐与 _run_password_login_core 的 finally 等价的收尾动作。
+        # finish_processing 本身是幂等的（内部先判断 key 是否存在），
+        # 即便 _run_password_login_core 已经跑过并自行调用过一次也不会出错，
+        # 因此这里无条件调用是安全的。
+        logger.error(f"【{account_id}】密码登录任务派发失败: {e}")
+        password_login_sessions[session_id]['status'] = 'failed'
+        password_login_sessions[session_id]['error'] = f'登录任务执行异常，请稍后重试: {e}'
+        try:
+            from app.services.captcha.password_login_state import password_login_state
+            password_login_state.finish_processing(account_id)
+        except Exception as state_e:
+            logger.warning(f"【{account_id}】清理密码登录状态时出错: {state_e}")
 
 
 def _run_password_login_core(

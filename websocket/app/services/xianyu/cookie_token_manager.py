@@ -723,7 +723,10 @@ class CookieTokenManager:
                     return False
 
             try:
-                from app.services.captcha.slider_stealth import run_slider_verification_with_fallback
+                from app.services.captcha.slider_stealth import (
+                    run_slider_verification_with_fallback,
+                    run_remote_captcha_solve,
+                )
 
                 # 重置"重取链接时 token 已可用"标志，避免读到上一次的残留值
                 self._refetch_token_ok = False
@@ -734,33 +737,57 @@ class CookieTokenManager:
                 # 配置了则优先走远程接口；远程超时/不可用时回退本机逻辑。
                 remote_config = await self._load_remote_captcha_config()
 
-                # 真实鼠标任务先按权重排队，其他模式保持使用原浏览器任务专用线程池；
-                # 两条路径都不占用 asyncio 默认线程池，避免饿死 aiohttp 的 DNS 解析。
-                # run_slider_verification_with_fallback: 远程(可选)→真人/主引擎(Playwright)→DrissionPage 兜底
-                # 返回 (是否成功, cookies, 通过引擎: remote/real_mouse/playwright/drissionpage/None)
-                slider_args = (
-                    f"{self.cookie_id}", verification_url, True, False, 20,
-                    self.cookies_str, self._request_captcha_url_sync, remote_config,
-                )
-                selected_slider_mode = await refresh_slider_mode_from_database()
-                if (
-                    remote_config is None
-                    and selected_slider_mode == SLIDER_MODE_REAL_MOUSE
-                ):
-                    # 本机真实鼠标任务先进入前置本地队列，再提交给原浏览器执行器。
-                    success, cookies, captcha_engine = await real_mouse_weighted_runner.submit(
-                        "local",
-                        run_slider_verification_with_fallback,
-                        *slider_args,
-                        weight_class="local",
-                        slider_mode=selected_slider_mode,
+                # 审查 Finding B：远程过滑块是纯 HTTP 请求（读超时下限 300 秒，
+                # 链接过期时最多再重试 2 次，最坏约 900 秒），不涉及任何本地
+                # 浏览器，因此必须在进入全局浏览器并发槽位保护的调度器
+                # （run_browser_task / real_mouse_weighted_runner）之前先单独
+                # 调用，避免这段无浏览器的等待白占一个槽位、饿死其它真正需要
+                # 浏览器的发布/续期任务。run_remote_captcha_solve 内部会派发到
+                # 专用线程池执行，不阻塞事件循环。
+                remote_result = None
+                if remote_config:
+                    remote_result = await run_remote_captcha_solve(
+                        f"{self.cookie_id}", verification_url, remote_config,
+                        self.cookies_str, self._request_captcha_url_sync, 20,
                     )
+
+                if remote_result is not None:
+                    # 远程给出了确定性结果（成功，或明确失败/链接过期重试用尽），
+                    # 全程没有碰本地浏览器，不需要、也不应该再走下面的槽位保护
+                    # 调度器——这里直接采用远程结果，避免"远程失败后又裸跑本地
+                    # 浏览器"的漏洞（下面的 run_slider_verification_with_fallback
+                    # 只有在 remote_result is None 时才会被调用，且调用方式没有
+                    # 变化，仍然整体经 run_browser_task/real_mouse_weighted_runner
+                    # 派发，槽位覆盖不受这次拆分影响）。
+                    success, cookies, captcha_engine = remote_result
                 else:
-                    success, cookies, captcha_engine = await run_browser_task(
-                        run_slider_verification_with_fallback,
-                        *slider_args,
-                        slider_mode=selected_slider_mode,
+                    # 真实鼠标任务先按权重排队，其他模式保持使用原浏览器任务专用线程池；
+                    # 两条路径都不占用 asyncio 默认线程池，避免饿死 aiohttp 的 DNS 解析。
+                    # run_slider_verification_with_fallback: 真人/主引擎(Playwright)→DrissionPage 兜底
+                    # 返回 (是否成功, cookies, 通过引擎: real_mouse/playwright/drissionpage/None)
+                    slider_args = (
+                        f"{self.cookie_id}", verification_url, True, False, 20,
+                        self.cookies_str, self._request_captcha_url_sync,
                     )
+                    selected_slider_mode = await refresh_slider_mode_from_database()
+                    if (
+                        remote_config is None
+                        and selected_slider_mode == SLIDER_MODE_REAL_MOUSE
+                    ):
+                        # 本机真实鼠标任务先进入前置本地队列，再提交给原浏览器执行器。
+                        success, cookies, captcha_engine = await real_mouse_weighted_runner.submit(
+                            "local",
+                            run_slider_verification_with_fallback,
+                            *slider_args,
+                            weight_class="local",
+                            slider_mode=selected_slider_mode,
+                        )
+                    else:
+                        success, cookies, captcha_engine = await run_browser_task(
+                            run_slider_verification_with_fallback,
+                            *slider_args,
+                            slider_mode=selected_slider_mode,
+                        )
 
                 # 重取验证链接的 Token 请求可能在任意结果分支下发新 Cookie（尤其是
                 # _m_h5_tk）。浏览器流程结束后统一写回，不能只在 token_ok 分支处理。
