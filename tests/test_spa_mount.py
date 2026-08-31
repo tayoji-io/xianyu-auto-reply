@@ -70,18 +70,20 @@ def test_unregistered_api_route_not_swallowed_by_spa(client):
     assert r.status_code == 404
 
 
-def test_health_trailing_slash_not_swallowed_by_spa(client):
+def test_health_trailing_slash_redirects_to_canonical_path(client):
     """`/health/`（比真实路由多一个尾部斜杠）不能被 SPA 挂载吞掉。
 
-    审查发现：`/health` 本身是普通 APIRoute，能被正确保护；但它的畸形
-    变体 `/health/` 并不会匹配到这条路由，同样会透传给 "/" SPA 挂载，
-    被伪装成 200 的 SPA 首页 HTML。
+    round 3 复审明确：这里不要求是 404——`app.router.default` 重构后，
+    Starlette 内置的 `redirect_slashes` 会先把 `/health/` 307 重定向到
+    规范路径 `/health`，根本走不到 `default`（也就走不到 SPA）。这既
+    满足"不被 SPA 吞掉"，又是标准的 URL 规范化语义，比强行 404 更好。
     """
-    r = client.get("/health/")
+    r = client.get("/health/", follow_redirects=False)
     assert not (r.status_code == 200 and "SPA-ROOT" in r.text), (
-        "/health/ 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML，而不是 404"
+        "/health/ 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML"
     )
-    assert r.status_code == 404
+    assert r.status_code == 307
+    assert r.headers["location"] == "http://testserver/health"
 
 
 def test_method_mismatch_on_real_endpoint_stays_405(client):
@@ -98,6 +100,9 @@ def test_method_mismatch_on_real_endpoint_stays_405(client):
         "/api/v1/auth/login (GET) 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML"
     )
     assert r.status_code == 405
+    # `app.router.default` 重构的收益之一：405 现在是 APIRoute.handle() 原生
+    # 生成的标准响应，带着正确的 Allow 头，而不是我们自己拼出来的 JSONResponse。
+    assert "POST" in r.headers.get("allow", "")
 
 
 def test_double_slash_variant_not_swallowed_by_spa(client):
@@ -139,6 +144,11 @@ def test_docs_redoc_variants_not_swallowed_by_spa(client):
 
     审查 Finding D：`/docs/whatever`、`/docs/`、`/redoc/` 这些变体在
     "裸路径正常工作"的假象下被漏保护，同样会透传给 SPA 挂载。
+
+    `/docs/`、`/redoc/` 属于"多一个尾部斜杠"，和 `/health/` 一样会被
+    `redirect_slashes` 307 到规范路径，不会走到 SPA；`/docs/whatever`
+    不是简单的斜杠变体，两种斜杠形态都不匹配任何真实路由，`redirect_slashes`
+    帮不上忙，最终落到 `default` 里被保留前缀护栏拦成 404。
     """
     # 裸路径不受影响，仍然是文档/schema 本身的真实内容。
     for path in ("/docs", "/redoc", "/openapi.json"):
@@ -146,10 +156,32 @@ def test_docs_redoc_variants_not_swallowed_by_spa(client):
         assert r.status_code == 200
         assert "SPA-ROOT" not in r.text
 
-    # 子路径变体必须被护栏拦住，不能被 SPA 吞成 200 HTML。
-    for path in ("/docs/whatever", "/docs/", "/redoc/"):
-        r = client.get(path)
+    # 多一个尾部斜杠：被 redirect_slashes 307 到规范路径，不是 404。
+    for path, canonical in (("/docs/", "/docs"), ("/redoc/", "/redoc")):
+        r = client.get(path, follow_redirects=False)
         assert not (r.status_code == 200 and "SPA-ROOT" in r.text), (
-            f"{path} 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML，而不是 404"
+            f"{path} 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML"
         )
-        assert r.status_code == 404
+        assert r.status_code == 307
+        assert r.headers["location"] == f"http://testserver{canonical}"
+
+    # 真正的未知子路径：任何斜杠形态都不匹配，必须被护栏拦成 404，不能被 SPA 吞掉。
+    r = client.get("/docs/whatever")
+    assert not (r.status_code == 200 and "SPA-ROOT" in r.text), (
+        "/docs/whatever 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML，而不是 404"
+    )
+    assert r.status_code == 404
+
+
+def test_uppercase_reserved_prefix_not_swallowed_by_spa(client):
+    """`/API/v1/x`（大写）不能绕过保留前缀护栏被 SPA 吞掉。
+
+    round 3 复审新发现：`_is_reserved_spa_path` 原来是大小写敏感比较，
+    `"/API".startswith("/api")` 为 False，护栏不触发。改为 `casefold()`
+    比较后，大小写不应该成为绕过保留前缀判断的手段。
+    """
+    r = client.get("/API/v1/x")
+    assert not (r.status_code == 200 and "SPA-ROOT" in r.text), (
+        "/API/v1/x 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML，而不是 404"
+    )
+    assert r.status_code == 404
