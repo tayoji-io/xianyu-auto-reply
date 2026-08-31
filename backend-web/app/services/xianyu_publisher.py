@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,7 @@ from loguru import logger
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from common.utils.browser_utils import ensure_playwright_browser_path, get_chromium_executable_path
 from common.services.publish_image_service import cleanup_temp_images, download_remote_image
+from common.services.browser_limiter import browser_slot
 
 
 class XianyuPublisher:
@@ -47,6 +49,15 @@ class XianyuPublisher:
         self.current_cookie: Optional[str] = None
         self.temp_image_paths: list[str] = []
         self.static_root = Path(static_root) if static_root else None
+        # 跨进程浏览器并发限流槽位（见 common/services/browser_limiter.py）。
+        # initialize()/close() 是两个独立方法，且发布批次会以
+        # reuse_browser=True、should_close=False 跨多次 publish_item() 调用
+        # 复用同一个浏览器（见 publish_execution_service.py），槽位必须覆盖
+        # 从这里真正 launch 到 close() 完全关闭的整个区间，因此不能用
+        # `async with browser_slot():` 包在单个方法体内（那样会在浏览器还
+        # 活着时提前释放），改为手动 __aenter__/__aexit__，在 initialize()
+        # 首次真正启动浏览器时进入，在 close() 里退出。
+        self._browser_slot_cm = None
 
     async def _resolve_upload_image_path(self, image_path: str) -> str:
         if re.match(r"^https?://", image_path, re.IGNORECASE):
@@ -90,31 +101,48 @@ class XianyuPublisher:
         if self.is_initialized and force_reinit:
             await self.close_only_browser()
 
-        ensure_playwright_browser_path()
-        self.playwright = await async_playwright().start()
+        # 真正要 launch 新浏览器了：占用全局并发槽位（force_reinit 场景下
+        # self._browser_slot_cm 可能已持有——上面 close_only_browser 只关旧
+        # 浏览器不释放槽位，此时视为同一个“浏览器名额”内的重启，不重复占用）。
+        if self._browser_slot_cm is None:
+            slot_cm = browser_slot()
+            await slot_cm.__aenter__()
+            self._browser_slot_cm = slot_cm
 
-        browser_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-web-security",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--window-size=1920,1080",
-            "--start-maximized",
-        ]
+        try:
+            ensure_playwright_browser_path()
+            self.playwright = await async_playwright().start()
 
-        chromium_path = get_chromium_executable_path()
+            browser_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--window-size=1920,1080",
+                "--start-maximized",
+            ]
 
-        launch_kwargs = dict(
-            headless=headless,
-            args=browser_args,
-            ignore_default_args=["--enable-automation"],
-        )
-        if chromium_path:
-            launch_kwargs["executable_path"] = chromium_path
+            chromium_path = get_chromium_executable_path()
 
-        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+            launch_kwargs = dict(
+                headless=headless,
+                args=browser_args,
+                ignore_default_args=["--enable-automation"],
+            )
+            if chromium_path:
+                launch_kwargs["executable_path"] = chromium_path
+
+            self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+        except Exception:
+            # launch 失败：槽位还没有对应的可用浏览器，立即释放，
+            # 不要等调用方稍后调用 close()（有的调用路径 initialize 失败
+            # 后不会调用 close，见 publish_item 的 should_close=False 场景）。
+            if self._browser_slot_cm is not None:
+                slot_cm, self._browser_slot_cm = self._browser_slot_cm, None
+                await slot_cm.__aexit__(*sys.exc_info())
+            raise
 
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
@@ -1808,6 +1836,15 @@ class XianyuPublisher:
             logger.error(f"关闭浏览器时出错: {e}")
         finally:
             self._cleanup_temp_images()
+            # 浏览器彻底关闭（或本来就没成功启动过），释放全局并发槽位；
+            # 无论 close() 走到哪一步都要执行，避免任何异常路径导致槽位泄漏
+            # （最坏情况下仍有 TTL 兜底自动回收，见 browser_limiter 模块说明）。
+            if self._browser_slot_cm is not None:
+                slot_cm, self._browser_slot_cm = self._browser_slot_cm, None
+                try:
+                    await slot_cm.__aexit__(None, None, None)
+                except Exception as slot_e:
+                    logger.warning(f"释放浏览器并发槽位时出错: {slot_e}")
 
     async def __aenter__(self):
         return self

@@ -20,6 +20,13 @@ from typing import Any, Callable, Deque, Dict, Optional
 from loguru import logger
 
 from common.services.captcha.concurrency import get_browser_task_executor
+# 跨进程浏览器并发限流（见 common/services/browser_limiter.py 与
+# common/services/captcha/concurrency.py 顶部关于同名旧接口的说明）。
+# run_browser_task() 已经在其内部包了 global_browser_slot()，但本类的
+# _dispatch_loop 是独立于 run_browser_task 的第二条调度路径（real_mouse
+# 前置加权队列，选中任务后直接调用 run_in_executor，不经过 run_browser_task），
+# 因此这里必须单独再包一次，否则真实鼠标模式会完全绕开限流。
+from common.services.browser_limiter import browser_slot as global_browser_slot
 from common.services.captcha.weighted_scheduler import (
     _BUCKET,
     _BUCKET_ORDER,
@@ -179,10 +186,11 @@ class WeightedTaskRunner:
                 )
 
                 try:
-                    result = await asyncio.get_running_loop().run_in_executor(
-                        self._executor_factory(),
-                        queued.call,
-                    )
+                    async with global_browser_slot():
+                        result = await asyncio.get_running_loop().run_in_executor(
+                            self._executor_factory(),
+                            queued.call,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     if not queued.future.done():
                         queued.future.set_exception(exc)

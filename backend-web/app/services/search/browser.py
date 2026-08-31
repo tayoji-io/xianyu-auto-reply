@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 from common.utils.browser_utils import ensure_playwright_browser_path, get_chromium_executable_path
+from common.services.browser_limiter import browser_slot
 
 # 修复Docker环境中的asyncio事件循环策略问题
 if sys.platform.startswith('linux') or os.getenv('DOCKER_ENV'):
@@ -66,6 +67,12 @@ class BrowserManager:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._user_data_dir: Optional[str] = None
+        # 跨进程浏览器并发限流槽位（见 common/services/browser_limiter.py）。
+        # init_browser()/close_browser() 各自调用方每次都是同一个函数内
+        # try/finally 配对（见 searcher.py），但为了和 XianyuPublisher 保持
+        # 一致、且不依赖调用方守规矩，这里同样用手动 __aenter__/__aexit__
+        # 挂在实例上：init_browser 真正 launch 前进入，close_browser 里退出。
+        self._browser_slot_cm = None
 
     @property
     def is_available(self) -> bool:
@@ -86,6 +93,13 @@ class BrowserManager:
             headless = True
 
         try:
+            # 真正要 launch 新浏览器了：占用全局并发槽位，
+            # 失败时下面 except 分支会调用 close_browser() 一并释放。
+            if self._browser_slot_cm is None:
+                slot_cm = browser_slot()
+                await slot_cm.__aenter__()
+                self._browser_slot_cm = slot_cm
+
             ensure_playwright_browser_path()
             self.playwright = await async_playwright().start()
 
@@ -153,6 +167,16 @@ class BrowserManager:
 
         except Exception as e:
             logger.warning(f"关闭浏览器时出错: {e}")
+        finally:
+            # 无论上面关闭步骤是否出错都要释放槽位，包括 init_browser 中途
+            # launch 失败后调用 close_browser 的场景；否则槽位要等 TTL 到期
+            # 才会被动回收。
+            if self._browser_slot_cm is not None:
+                slot_cm, self._browser_slot_cm = self._browser_slot_cm, None
+                try:
+                    await slot_cm.__aexit__(None, None, None)
+                except Exception as slot_e:
+                    logger.warning(f"释放浏览器并发槽位时出错: {slot_e}")
 
     async def set_cookies(self, cookie_value: str) -> bool:
         """设置浏览器cookies"""

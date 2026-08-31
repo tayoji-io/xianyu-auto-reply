@@ -101,22 +101,53 @@ def _run_password_login_sync(
     show_browser: bool,
     user_id: int
 ):
-    """同步执行密码登录（在独立线程中运行）
-    
-    注意：Windows上需要设置正确的事件循环策略才能在子线程中使用Playwright
+    """密码登录线程入口（在独立线程中运行），桥接全局浏览器并发限流槽位。
+
+    注意：Windows上需要设置正确的事件循环策略才能在子线程中使用Playwright。
+
+    本线程本身没有事件循环，无法直接 `await run_browser_task(...)`；这里现开
+    一个临时事件循环（asyncio.run），把真正会长时间阻塞的同步登录流程
+    （_run_password_login_core，覆盖浏览器创建到 slider_instance.close()
+    关闭的完整生命周期）通过 run_browser_task 派发到浏览器任务专用线程池
+    （而不是 asyncio.to_thread 的默认线程池——避免占用 aiohttp DNS 解析共用
+    的默认池）。run_browser_task 内部已经包了全局浏览器并发槽位
+    global_browser_slot()，这里不需要重复获取；这个临时事件循环存在的
+    唯一目的，就是让该槽位的心跳续期协程有地方跑，不会被这段同步代码
+    卡住整个 90 秒 TTL 窗口。
     """
-    # 检查账号是否已禁用
-    from app.services.captcha.concurrency import should_skip_account
+    # 检查账号是否已禁用：提前返回，避免白白等待浏览器并发槽位
+    from app.services.captcha.concurrency import should_skip_account, run_browser_task
     if should_skip_account(account_id):
         password_login_sessions[session_id]['status'] = 'failed'
         password_login_sessions[session_id]['error'] = '账号已禁用，请先在账号管理中启用'
         logger.warning(f"【{account_id}】账号已禁用，跳过密码登录")
         return
-    
+
     # Windows上需要设置事件循环策略，否则Playwright无法启动subprocess
+    # （必须在 asyncio.run 创建事件循环之前设置，策略是进程级的）
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    
+
+    asyncio.run(run_browser_task(
+        _run_password_login_core,
+        session_id, account_id, account, password, show_browser, user_id,
+    ))
+
+
+def _run_password_login_core(
+    session_id: str,
+    account_id: str,
+    account: str,
+    password: str,
+    show_browser: bool,
+    user_id: int
+):
+    """密码登录同步流程本体：创建浏览器、登录、保存结果、清理实例。
+
+    由 _run_password_login_sync 通过 run_browser_task 派发到浏览器任务
+    专用线程池中执行，覆盖从浏览器创建到 slider_instance.close() 完全
+    关闭的整个区间，与外层持有的全局浏览器并发槽位生命周期一致。
+    """
     from app.services.captcha.xianyu_slider_stealth import XianyuSliderStealth
     from app.services.captcha.concurrency import concurrency_manager
     

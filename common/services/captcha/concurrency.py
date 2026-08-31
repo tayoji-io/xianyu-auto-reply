@@ -15,6 +15,12 @@ from typing import Any, Callable, Dict, Optional, Set
 
 from loguru import logger
 
+# 跨进程浏览器并发限流（Redis SET NX，见 common/services/browser_limiter.py）。
+# 注意：本模块下方还有一套同名旧接口 acquire_browser_slot(user_id)/release_browser_slot(user_id)
+# ——那是进程内的滑块验证专用并发控制（BrowserSlotManager），与这里的跨进程限流是两套
+# 完全不同的机制，因此这里改名导入为 global_browser_slot，避免二者混淆。
+from common.services.browser_limiter import browser_slot as global_browser_slot
+
 
 # ==================== 禁用账号管理 ====================
 
@@ -547,8 +553,17 @@ async def run_browser_task(func: Callable[..., Any], *args: Any, **kwargs: Any) 
 
     用于所有长阻塞的浏览器/验证码任务，避免占用 asyncio 默认线程池导致
     aiohttp DNS 解析被饿死、网络请求集体超时。
+
+    本函数是所有同步浏览器任务（滑块验证主引擎/DrissionPage兜底/真实鼠标、
+    密码登录、Cookie 浏览器续期/刷新等）唯一的公共调度入口，因此把跨进程
+    浏览器并发槽位 global_browser_slot() 包在这里、包住整个线程池调用，
+    而不是分别包在每个调用方或每个同步实现文件里——
+    这些同步函数自己没有事件循环，无法直接 `async with`；而在这唯一的
+    调度入口统一持有槽位，能保证覆盖“进入线程池执行同步函数”到“同步函数
+    返回（浏览器已 close）”的完整区间，且不会遗漏任何一条同步调用路径。
     """
     loop = asyncio.get_running_loop()
     call = functools.partial(func, *args, **kwargs)
-    return await loop.run_in_executor(get_browser_task_executor(), call)
+    async with global_browser_slot():
+        return await loop.run_in_executor(get_browser_task_executor(), call)
 
