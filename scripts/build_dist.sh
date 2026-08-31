@@ -58,13 +58,23 @@ for svc in "${SERVICES[@]}"; do
   # backend-web/.env.example 里的 EXTERNAL_API_KEY=zhinian_bk 是具体值而非
   # your_xxx/change-me 这类占位符，打包出去等于让所有沙盒默认共用同一个
   # 指向原作者服务器的第三方密钥，必须排除。
+  # 额外排除 Dockerfile/pyproject.toml/*.bat：沙盒不会执行 docker build，
+  # 也不会跑 Windows 批处理，这三类文件对沙盒运行纯属冗余（依赖信息已经
+  # 冗余存在于顶层合并生成的 requirements.txt 里）；顺带消除了下面凭据扫描
+  # 的一个盲区主要实际载体——Dockerfile 的 `ENV KEY=value` 是最常见的手滑
+  # 写死凭据的位置之一，不打包这几个文件就不必依赖扫描器兜底。
   # -c core.quotePath=false：git 默认会把含非 ASCII 字节（如中文文件名）的
   # 路径输出成带引号的八进制转义字符串（例如 "\345\201\234...bat"），字面
   # 传给 rsync --files-from 会导致 stat 失败——仓库里的 启动.bat/停止.bat
-  # 就踩了这个坑，必须关掉引用才能拿到原始 UTF-8 文件名。
+  # 就踩了这个坑（虽然 .bat 现在也被排除了，但这个转义问题对任何非 ASCII
+  # 文件名都成立，仍然需要关掉引用才能让下面的 awk 排除规则按字面文本匹配）。
   filelist="$(mktemp)"
   git -c core.quotePath=false -C "$ROOT/$svc" ls-files \
-    | awk '$0 !~ /\.py$/ && $0 !~ /(^|\/)\.env\.example$/' > "$filelist"
+    | awk '$0 !~ /\.py$/ \
+        && $0 !~ /(^|\/)\.env\.example$/ \
+        && $0 !~ /(^|\/)Dockerfile$/ \
+        && $0 !~ /(^|\/)pyproject\.toml$/ \
+        && $0 !~ /\.bat$/' > "$filelist"
   while IFS= read -r pyc; do
     printf '%s\n' "${pyc#"$ROOT/$svc/"}" >> "$filelist"
   done < <(find "$ROOT/$svc" -name '*.pyc' -not -path '*/__pycache__/*')
@@ -111,7 +121,11 @@ echo "==> 校验：产物中不应包含疑似凭据（这份发布仓是公开�
 #    API_KEY/SECRET(_KEY)?/PASSWORD/PASSWD/PWD/ACCESS_KEY/PRIVATE_KEY/TOKEN/
 #    CLIENT_SECRET 结尾（后缀匹配而非子串匹配，避免 ACCESS_TOKEN_EXPIRE_
 #    MINUTES=30、TOKEN_REFRESH_INTERVAL=72000 这类名字里含 TOKEN 但实际是
-#    数值配置的行被误报）。
+#    数值配置的行被误报）。行首允许可选的 `ENV `/`export ` 前缀（大小写不
+#    敏感），覆盖 Dockerfile 的 `ENV KEY=value` 和 shell 脚本的
+#    `export KEY=value` 写法——这两种是"手滑写死凭据"最常见的落地位置，
+#    只按裸 `KEY=value` 匹配会整行跳过（`ENV` 被误当成键名，`ENV` 后面是
+#    空格不是 `=`/`:`，正则直接不匹配）。
 #
 # 占位符判定标准（命中即视为"看起来本来就是留给用户填的示例"，不报错）：
 #   - 以 your_/your-/change-me/change_me/changeme/xxx/*** 开头
@@ -136,7 +150,11 @@ SENSITIVE_KEY_SUFFIX = re.compile(
     r'ACCESS[_-]?KEY|PRIVATE[_-]?KEY|TOKEN|CLIENT[_-]?SECRET)$',
     re.IGNORECASE,
 )
-ASSIGN_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_.\-]*)\s*[:=]\s*(.+)$')
+# 可选前缀 `ENV `/`export `（Dockerfile / shell 写法）+ 裸 `KEY=value`
+ASSIGN_RE = re.compile(
+    r'^(?:(?:env|export)\s+)?([A-Za-z_][A-Za-z0-9_.\-]*)\s*[:=]\s*(.+)$',
+    re.IGNORECASE,
+)
 PLACEHOLDER_RE = re.compile(
     r'^(your[_-]|change[_-]?me|xxx+|\*{3,}|redact|replace|todo'
     r'|<.*>|\$\{.*\}|\{\{.*\}\}'
