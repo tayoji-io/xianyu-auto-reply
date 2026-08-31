@@ -28,7 +28,14 @@ _GATEWAY_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 _GATEWAY_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 DEFAULT_AI_SETTINGS = {
-    # 有网关 key 时默认开启，用户无需自备模型 key
+    # 注意：这个值只对直接读取 DEFAULT_AI_SETTINGS 字典的调用方（如单测）可见。
+    # 在真实账号读取路径 _extract_settings 里，本字段会被下方
+    # `payload["ai_enabled"] = read_ai_enabled(stored)` 无条件覆盖——
+    # 对从未存过 ai_reply_settings 的全新账号，read_ai_enabled({}) 恒为 False。
+    # 也就是说"有网关 key 时默认开启"目前只体现在 api_key/base_url/model_name
+    # 这几个字段上，AI 自动回复本身默认仍是关闭的，需要用户主动打开开关
+    # ——这是有意为之的产品决策（自动回复会消耗用户的 RunJobs 余额、并代表
+    # 用户与买家对话，默认开启等于替用户做重大决定），不是待修的 bug。
     "ai_enabled": bool(_GATEWAY_API_KEY),
     "provider_type": DEFAULT_AI_PROVIDER_TYPE,
     "model_name": os.getenv("AI_MODEL", "").strip() or "qwen-plus",
@@ -52,11 +59,25 @@ class AIReplySettingsService:
     def _extract_settings(self, account: XYAccount) -> dict:
         stored = (account.metadata_json or {}).get("ai_reply_settings") or {}
         payload = DEFAULT_AI_SETTINGS.copy()
-        # 空字符串视同未设置（None），回落到默认值（含 RunJobs 网关 key/地址）。
-        # 历史/导入数据里常见 api_key、model_name 等字段被存成 ""（从未配置过），
-        # 若按 "" 字面值覆盖默认值，会把新的网关默认配置永久屏蔽掉。
-        # 数值(0)/布尔(False)与 "" 类型不同，不受影响，仍按字面值覆盖。
-        payload.update({k: v for k, v in stored.items() if v not in (None, "")})
+        # 只对"空字符串等价于从未配置过"的连接参数字段，把 "" 视同未设置（None），
+        # 回落到默认值（含 RunJobs 网关 key/地址）——历史/导入数据里这几个字段常见
+        # 被存成 ""（从未配置过），若按 "" 字面值覆盖默认值，会把新的网关默认配置
+        # 永久屏蔽掉。
+        # 不能对整个字典一刀切：custom_prompts 存 "" 的真实含义是"用户主动清空了
+        # 自定义人设"，是一次有意义的保存结果，不是"未配置"；如果把它也当成未设置、
+        # 回落到 AI_PERSONA 默认人设，就会用平台默认人设静默覆盖用户上一次的选择，
+        # 这段文案会真实影响 AI 代表卖家跟买家对话的语气和内容。
+        # ai_time_range_start/end 的默认值本来就是 ""，覆盖与否结果相同，不受影响。
+        # max_discount_percent 等数值字段即使脏数据存了字面 ""，也不受这个集合影响，
+        # 仍走下面 int(payload.get(...) or 0) 的旧逻辑。
+        _EMPTY_AS_UNSET = {"api_key", "base_url", "model_name"}
+        payload.update({
+            k: v for k, v in stored.items()
+            if v is not None and not (k in _EMPTY_AS_UNSET and v == "")
+        })
+        # 这一行无条件覆盖 DEFAULT_AI_SETTINGS["ai_enabled"]（见上方该字段的注释）：
+        # 真实账号是否开启 AI 回复只由这里、也就是 stored 里显式存过的
+        # ai_enabled/enabled 决定，与网关 key 是否存在无关。
         payload["ai_enabled"] = read_ai_enabled(stored)
         payload["max_discount_percent"] = int(payload.get("max_discount_percent", 10) or 0)
         payload["max_discount_amount"] = int(payload.get("max_discount_amount", 100) or 0)
