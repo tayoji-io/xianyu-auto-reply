@@ -104,6 +104,46 @@ if find "$OUT/app" -name '*.py' | grep -q .; then
   exit 1
 fi
 
+echo "==> 脱敏：清理 human_trails 采集样本里残留的真实会话数据（只处理产物副本，不动源码仓）"
+"$PY" - "$OUT" <<'SANITIZEEOF'
+# human_trails/*.json 是验证码/登录滑块的真人轨迹采集样本，采集时顺手落盘
+# 了浏览器真实 cookies、带 token 的登录/滑块验证链接——这些是采集副产品，
+# common/services/captcha/real_mouse_slider.py::_load_drags() 只读取
+# trail/passed（业务场景另外还读 slide_code/slider_distance，均不在剔除
+# 名单内），功能上完全用不到，却是真实账号的会话数据，绝不能随公开产物
+# 分发给订阅用户。
+#
+# 按字段名剔除、不按文件名做区分：不只是 4 个 human_trail_login_pass_*.json
+# 带完整登录 cookies，14 个 human_trail_pass_*.json（业务滑块样本）虽然没有
+# cookies 字段，但同样带了含真实 x5secdata token 的 frame_url——统一按这
+# 5 个字段名处理，对全部 18 个样本一视同仁，不依赖"哪种文件名才需要脱敏"
+# 这种容易漏判的假设。
+import glob
+import json
+import os
+import sys
+
+OUT = sys.argv[1]
+TRAILS_DIR = os.path.join(OUT, "app", "common", "services", "captcha", "human_trails")
+
+SENSITIVE_FIELDS = ("cookies", "login_url", "slider_url", "frame_url", "login_response")
+
+if os.path.isdir(TRAILS_DIR):
+    for path in sorted(glob.glob(os.path.join(TRAILS_DIR, "*.json"))):
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            continue
+        removed = [k for k in SENSITIVE_FIELDS if k in data]
+        if not removed:
+            continue
+        for k in SENSITIVE_FIELDS:
+            data.pop(k, None)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        print("  已脱敏: " + os.path.relpath(path, OUT) + "（剔除字段: " + ", ".join(removed) + "）")
+SANITIZEEOF
+
 echo "==> 校验：产物中不应包含疑似凭据（这份发布仓是公开的，会被每个订阅用户 clone）"
 "$PY" - "$OUT" <<'CREDSCANEOF'
 # 扫描 $OUT 全树，命中即报错退出（不是警告）。分两类检查：
@@ -126,6 +166,18 @@ echo "==> 校验：产物中不应包含疑似凭据（这份发布仓是公开�
 #    `export KEY=value` 写法——这两种是"手滑写死凭据"最常见的落地位置，
 #    只按裸 `KEY=value` 匹配会整行跳过（`ENV` 被误当成键名，`ENV` 后面是
 #    空格不是 `=`/`:`，正则直接不匹配）。
+#
+#    另外扫描 JSON 结构里的 `"key": value`（JSON 文件通常压缩成一整行，
+#    用 finditer 找一行内出现的所有键，而不是只看行首）：
+#      a) 值为字符串且键名匹配上面同一套 SENSITIVE_KEY_SUFFIX 时，走同样
+#         的占位符判定（覆盖 `{"api_key": "sk-real"}` 这类通用 JSON 凭据）；
+#      b) 键名命中一小撮"结构性敏感"字段名（cookies/login_response/
+#         slider_url/frame_url/login_url）时无条件报错，不做占位符豁免——
+#         这几个字段不存在"合法占位符"，值是数组/对象也一样命中（例如
+#         `"cookies": [...]`）。这是从一次真实泄露（human_trails/*.json
+#         采集样本残留的完整登录会话 cookies + 带 token 的验证链接）里补的
+#         教训，脚本已经在下面把这些字段从产物副本里脱敏掉，这里是纵深
+#         防御：万一脱敏步骤以后被改坏，构建仍会在这一步失败。
 #
 # 占位符判定标准（命中即视为"看起来本来就是留给用户填的示例"，不报错）：
 #   - 以 your_/your-/change-me/change_me/changeme/xxx/*** 开头
@@ -167,6 +219,16 @@ CONTENT_SKIP_EXT = {
     '.woff', '.woff2', '.ttf', '.eot',
 }
 
+# JSON 结构：`"key":` 后面跟字符串/数组/对象都能匹配（只捕获键名，值类型
+# 交给调用处按需再判断），配合 finditer 在一整行里找出全部出现的键。
+JSON_KEY_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_.\-]*)"\s*:\s*')
+# 值恰好是引号字符串时，用这个从紧跟键名之后的文本里把该字符串取出来。
+JSON_STRING_VALUE_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"')
+# 无条件报错、不做占位符豁免的 JSON 字段名（小写比较）。
+JSON_STRUCTURAL_SENSITIVE_KEYS = {
+    'cookies', 'cookie', 'login_response', 'slider_url', 'frame_url', 'login_url',
+}
+
 findings = []
 
 for root, dirs, files in os.walk(OUT):
@@ -195,17 +257,44 @@ for root, dirs, files in os.walk(OUT):
                     stripped = line.strip()
                     if not stripped or stripped.startswith('#') or stripped.startswith('//'):
                         continue
+
+                    # a) 裸 KEY=value / KEY: value（.env、Dockerfile ENV、shell export……）
                     m = ASSIGN_RE.match(stripped)
-                    if not m:
-                        continue
-                    key, value = m.group(1), m.group(2).strip().strip('\'"')
-                    if not value:
-                        continue
-                    if not SENSITIVE_KEY_SUFFIX.search(key):
-                        continue
-                    if PLACEHOLDER_RE.search(value) or PLACEHOLDER_DOMAIN_RE.search(value):
-                        continue
-                    findings.append(rel + ":" + str(lineno) + ": 疑似真实凭据（非占位符）: " + key + "=...")
+                    if m:
+                        key, value = m.group(1), m.group(2).strip().strip('\'"')
+                        if (
+                            value
+                            and SENSITIVE_KEY_SUFFIX.search(key)
+                            and not PLACEHOLDER_RE.search(value)
+                            and not PLACEHOLDER_DOMAIN_RE.search(value)
+                        ):
+                            findings.append(rel + ":" + str(lineno) + ": 疑似真实凭据（非占位符）: " + key + "=...")
+
+                    # b) JSON 结构：一行内可能出现多个 "key": value，逐个检查
+                    for jm in JSON_KEY_RE.finditer(stripped):
+                        jkey = jm.group(1)
+                        jkey_lower = jkey.lower()
+                        if jkey_lower in JSON_STRUCTURAL_SENSITIVE_KEYS:
+                            findings.append(
+                                rel + ":" + str(lineno)
+                                + ': JSON 字段疑似携带真实会话数据（结构性敏感字段）: "' + jkey + '"'
+                            )
+                            continue
+                        if not SENSITIVE_KEY_SUFFIX.search(jkey):
+                            continue
+                        rest = stripped[jm.end():]
+                        vm = JSON_STRING_VALUE_RE.match(rest)
+                        if not vm:
+                            continue  # 值不是引号字符串（数组/对象/数字/布尔），上面的结构性检查已经兜底
+                        jvalue = vm.group(1)
+                        if not jvalue:
+                            continue
+                        if PLACEHOLDER_RE.search(jvalue) or PLACEHOLDER_DOMAIN_RE.search(jvalue):
+                            continue
+                        findings.append(
+                            rel + ":" + str(lineno)
+                            + ': JSON 疑似真实凭据（非占位符）: "' + jkey + '": ...'
+                        )
         except (OSError, UnicodeDecodeError):
             continue
 
