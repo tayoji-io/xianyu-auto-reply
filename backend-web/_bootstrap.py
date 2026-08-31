@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import faulthandler
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -281,17 +282,25 @@ class _SPAStaticFiles(StaticFiles):
             raise
 
 
+from starlette.routing import Match, Mount
+
 _web_dir = Path(os.getenv("WEB_DIR", "web"))
 _spa_static_app: _SPAStaticFiles | None = None
+_spa_mount_route: Mount | None = None
 if _web_dir.exists():
     _spa_static_app = _SPAStaticFiles(directory=str(_web_dir), html=True)
-    app.mount("/", _spa_static_app, name="spa")
+    # 用 Mount(...) + routes.append(...) 而不是 app.mount(...)（两者行为完全等价，
+    # 参见 Starlette Router.mount 的实现），是为了拿到 Mount 路由对象本身的引用
+    # （下面 _probe_route_match_excluding_spa 要在探测匹配时排除掉它）。
+    _spa_mount_route = Mount("/", app=_spa_static_app, name="spa")
+    app.router.routes.append(_spa_mount_route)
     logger.info(f"前端 SPA 已挂载: / -> {_web_dir.absolute()}")
 else:
     logger.warning(f"前端目录不存在，跳过 SPA 挂载: {_web_dir.absolute()}")
 
 
-# 保留前缀护栏：防止 /api、/health 被 "/" 处的 SPA 挂载吞掉
+# 保留前缀护栏：防止 /api、/health、/docs、/redoc、/openapi.json 被 "/" 处的
+# SPA 挂载吞掉
 #
 # 背景：`api_router` 是以 `_IncludedRouter` 惰性展开的；对于它无法匹配到的请求
 # （拼错的/已下线的/尚未实现的接口路径，如 /api/v1/definitely-not-a-real-endpoint，
@@ -299,28 +308,77 @@ else:
 # 请求交给排在其后、以 "/" 为前缀的 SPA Mount —— 而 Mount.matches() 只看路径前缀，
 # 不看方法，对任何路径都无条件返回 Match.FULL，于是这些请求会被伪装成 200 的
 # 前端页面 HTML，而不是应有的 404（也包括真实接口但请求方法不对的情况，例如
-# 对一个只接受 POST 的接口发 GET）。
+# 对一个只接受 POST 的接口发 GET）。/docs、/redoc、/openapi.json 三个文档路径的
+# 裸路径本身是独立注册的 Route、不受影响，但它们的子路径变体（如 /docs/whatever、
+# /docs/、/redoc/）同样会透传到 SPA，一并纳入保留前缀。
 #
 # 这里不与路由匹配算法竞争优先级（那样容易和 Starlette 的
 # "先记录 PARTIAL、末尾才用于生成 405" 逻辑打架，见开发记录），而是在请求真正
 # 处理完之后做一次针对性核实：只要最终实际处理这个请求的 ASGI 应用就是我们
 # 挂载的 SPA 静态站点本身（request.scope["endpoint"] is _spa_static_app），
-# 且请求路径落在 /api 或 /health 这两个后端保留前缀下，就判定这是一次被误吞的
-# 请求，改写成 404，绝不放行 SPA 的 200 HTML。
-_SPA_RESERVED_PREFIXES = ("/api", "/health")
+# 且请求路径落在下面这些后端保留前缀下，就判定这是一次被误吞的请求。
+_SPA_RESERVED_PREFIXES = ("/api", "/health", "/docs", "/redoc", "/openapi.json")
+
+_MULTI_SLASH_RE = re.compile(r"/{2,}")
+
+
+def _normalize_spa_guard_path(path: str) -> str:
+    """合并连续斜杠，避免 //api/v1/x 这类变体绕过下面的前缀判断。"""
+    return _MULTI_SLASH_RE.sub("/", path)
+
+
+def _is_reserved_spa_path(path: str) -> bool:
+    """按路径段边界比较，而不是裸 str.startswith()。
+
+    裸 startswith 会把 /apiary、/healthy-tips 这类"恰好以保留前缀开头，
+    但其实是合法前端路由名字"的路径也判定为保留路径而误堵；只有整段路径
+    等于某个保留前缀、或以"保留前缀 + /"开头，才算真的落在该前缀下。
+    """
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in _SPA_RESERVED_PREFIXES)
+
+
+def _probe_route_match_excluding_spa(method: str, path: str) -> Match:
+    """在真实路由表（排除 SPA 挂载本身）里独立做一次匹配。
+
+    用来区分两种都会被 SPA 误吞、但语义完全不同的情况：
+    - PARTIAL：路径本身是已注册的真实接口，只是请求方法不对（应 405）；
+    - NONE：路径压根没有任何真实路由认识它（应 404）。
+    """
+    probe_scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "root_path": "",
+        "headers": [],
+        "query_string": b"",
+    }
+    found_partial = False
+    for route in app.router.routes:
+        if route is _spa_mount_route:
+            continue
+        match, _child_scope = route.matches(probe_scope)
+        if match == Match.FULL:
+            # 理论上走不到这里：真有 FULL 匹配的话，原始请求早在 SPA 挂载
+            # 之前就已经被这条路由接管了，request.scope["endpoint"] 不会是
+            # SPA。保留这个分支只是为了防御性地不误报 405。
+            return Match.FULL
+        if match == Match.PARTIAL:
+            found_partial = True
+    return Match.PARTIAL if found_partial else Match.NONE
 
 
 @app.middleware("http")
 async def _guard_reserved_prefixes_from_spa(request, call_next):
     response = await call_next(request)
-    if (
-        _spa_static_app is not None
-        and request.scope.get("endpoint") is _spa_static_app
-        and request.url.path.startswith(_SPA_RESERVED_PREFIXES)
-    ):
-        from fastapi.responses import JSONResponse
+    if _spa_static_app is not None and request.scope.get("endpoint") is _spa_static_app:
+        normalized_path = _normalize_spa_guard_path(request.url.path)
+        if _is_reserved_spa_path(normalized_path):
+            from fastapi.responses import JSONResponse
 
-        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+            match = _probe_route_match_excluding_spa(request.method, normalized_path)
+            if match == Match.PARTIAL:
+                return JSONResponse(status_code=405, content={"detail": "Method Not Allowed"})
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
     return response
 
 
