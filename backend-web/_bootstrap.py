@@ -282,11 +282,46 @@ class _SPAStaticFiles(StaticFiles):
 
 
 _web_dir = Path(os.getenv("WEB_DIR", "web"))
+_spa_static_app: _SPAStaticFiles | None = None
 if _web_dir.exists():
-    app.mount("/", _SPAStaticFiles(directory=str(_web_dir), html=True), name="spa")
+    _spa_static_app = _SPAStaticFiles(directory=str(_web_dir), html=True)
+    app.mount("/", _spa_static_app, name="spa")
     logger.info(f"前端 SPA 已挂载: / -> {_web_dir.absolute()}")
 else:
     logger.warning(f"前端目录不存在，跳过 SPA 挂载: {_web_dir.absolute()}")
+
+
+# 保留前缀护栏：防止 /api、/health 被 "/" 处的 SPA 挂载吞掉
+#
+# 背景：`api_router` 是以 `_IncludedRouter` 惰性展开的；对于它无法匹配到的请求
+# （拼错的/已下线的/尚未实现的接口路径，如 /api/v1/definitely-not-a-real-endpoint，
+# 或 /health 的畸形变体如多一个斜杠的 /health/），Starlette 的路由算法最终会把
+# 请求交给排在其后、以 "/" 为前缀的 SPA Mount —— 而 Mount.matches() 只看路径前缀，
+# 不看方法，对任何路径都无条件返回 Match.FULL，于是这些请求会被伪装成 200 的
+# 前端页面 HTML，而不是应有的 404（也包括真实接口但请求方法不对的情况，例如
+# 对一个只接受 POST 的接口发 GET）。
+#
+# 这里不与路由匹配算法竞争优先级（那样容易和 Starlette 的
+# "先记录 PARTIAL、末尾才用于生成 405" 逻辑打架，见开发记录），而是在请求真正
+# 处理完之后做一次针对性核实：只要最终实际处理这个请求的 ASGI 应用就是我们
+# 挂载的 SPA 静态站点本身（request.scope["endpoint"] is _spa_static_app），
+# 且请求路径落在 /api 或 /health 这两个后端保留前缀下，就判定这是一次被误吞的
+# 请求，改写成 404，绝不放行 SPA 的 200 HTML。
+_SPA_RESERVED_PREFIXES = ("/api", "/health")
+
+
+@app.middleware("http")
+async def _guard_reserved_prefixes_from_spa(request, call_next):
+    response = await call_next(request)
+    if (
+        _spa_static_app is not None
+        and request.scope.get("endpoint") is _spa_static_app
+        and request.url.path.startswith(_SPA_RESERVED_PREFIXES)
+    ):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return response
 
 
 @app.exception_handler(Exception)

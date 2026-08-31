@@ -45,23 +45,40 @@ def test_unknown_frontend_route_falls_back_to_spa(client):
     assert "SPA-ROOT" in r.text
 
 
-def test_real_api_route_not_swallowed_by_spa(client):
-    """`/api/v1/*` 走的是 `_IncludedRouter` 惰性展开路径（与 `/health` 不同），
+def test_unregistered_api_route_not_swallowed_by_spa(client):
+    """`/api/v1/*` 走的是 `_IncludedRouter` 惰性展开路径（与 `/health` 不同）。
 
-    必须单独验证：SPA 的 `/` 挂载不能把它吞掉、回退成 SPA 首页 HTML。
-    用 /openapi.json 强制展开路由表，挑一条真实存在的 API 路径请求。
-    判据：只要响应不是 200+SPA HTML，就说明请求命中了 API 路由（未被 SPA 吞掉）。
-    401/403/405/422 均视为通过——它们是 API 路由自身的鉴权/校验行为。
+    审查发现：早期实现里，请求一条**根本不存在**的 API 路径
+    （拼错的/已下线的/尚未实现的接口）会被 `_IncludedRouter` 判定为
+    Match.NONE，进而透传给排在其后的 "/" SPA 挂载，被伪装成 200 的
+    SPA 首页 HTML —— 这比"吞掉一条已注册路径"更隐蔽也更危险：调用方
+    按状态码判断成败时，会把一个不存在的接口误判为"请求成功"。
+
+    这里刻意选一条在 /openapi.json 中确认**不存在**的路径，断言它
+    仍然是 404，而不是被 SPA 吞成 200 的 HTML。
     """
     openapi = client.get("/openapi.json").json()
-    real_paths = [p for p in openapi["paths"] if p.startswith("/api/v1/")]
-    assert real_paths, "openapi.json 中应至少包含一条 /api/v1/* 路径"
-
-    target = "/api/v1/users/me"
-    assert target in real_paths, f"{target} 不在 openapi 路由表中，请改选一条真实存在的路径"
+    target = "/api/v1/definitely-not-a-real-endpoint"
+    assert target not in openapi["paths"], (
+        f"{target} 意外出现在 openapi 路由表中，请换一条确认不存在的路径"
+    )
 
     r = client.get(target)
     assert not (r.status_code == 200 and "SPA-ROOT" in r.text), (
-        f"{target} 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML，而不是 API 响应"
+        f"{target} 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML，而不是 404"
     )
-    assert r.status_code in (401, 403, 405, 422)
+    assert r.status_code == 404
+
+
+def test_health_trailing_slash_not_swallowed_by_spa(client):
+    """`/health/`（比真实路由多一个尾部斜杠）不能被 SPA 挂载吞掉。
+
+    审查发现：`/health` 本身是普通 APIRoute，能被正确保护；但它的畸形
+    变体 `/health/` 并不会匹配到这条路由，同样会透传给 "/" SPA 挂载，
+    被伪装成 200 的 SPA 首页 HTML。
+    """
+    r = client.get("/health/")
+    assert not (r.status_code == 200 and "SPA-ROOT" in r.text), (
+        "/health/ 被 SPA 挂载吞掉了：返回了 200 的 SPA HTML，而不是 404"
+    )
+    assert r.status_code == 404
