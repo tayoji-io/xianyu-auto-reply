@@ -125,11 +125,22 @@ if stage("apt"):
     )
     # 平台以容器方式运行，禁用发行版自带的服务管理，统一交给 supervisor
     run("sudo systemctl disable mariadb redis-server 2>/dev/null || true", check=False)
-    run("sudo pkill -f mariadbd || true", check=False)
-    run("sudo pkill -f redis-server || true", check=False)
+    # 注意：不能用 `pkill -f mariadbd`——run() 经 shell=True 执行，
+    # 实际调用的是 `sh -c "sudo pkill -f mariadbd || true"`，这条 sh 进程自身的
+    # 完整命令行里就含有 "mariadbd" 字样，会被 -f（按完整命令行匹配）连带命中并杀掉
+    # 执行它自己的 shell，导致 `|| true` 因宿主 shell 已死而永远不会被求值
+    # （退出码从而变成不可信的 -15）。改用 -x 按精确进程名（comm，不含参数）匹配，
+    # 不会命中调用它的 sh/sudo 进程。
+    run("sudo pkill -x mariadbd || true", check=False)
+    run("sudo pkill -x redis-server || true", check=False)
     mark("apt")
 
 # ---- 阶段 datadir：数据目录与配置文件 ----
+# 注意：my.cnf / redis.conf 用 write_text 整段覆写，且只在本阶段"首次"执行时写一次
+# （幂等由 stage()/mark() 保证）。以后若要调整 buffer pool、max_connections、
+# maxmemory 等参数，必须先手动删除 ~/workspace/.stage 里的 "datadir" 这一行，
+# 否则 stage("datadir") 会直接返回 False、配置文件不会被重新生成，
+# 光改这里的数值代码不会在已初始化过的沙盒里生效。
 if stage("datadir"):
     mysql_dir = DATA_DIR / "mysql"
     redis_dir = DATA_DIR / "redis"
