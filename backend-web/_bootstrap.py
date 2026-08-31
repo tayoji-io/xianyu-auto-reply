@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -260,6 +261,32 @@ async def health_check():
             "database": db_status,
         },
     }
+
+
+# 挂载前端 SPA（必须在 API 路由与 /health 之后）
+# html=True 使命中目录（如 "/"）的请求回退到该目录下的 index.html；
+# 但当前 Starlette 版本对“路径未命中任何真实文件”（例如前端路由 /accounts）
+# 不会回退到 index.html、而是直接 404，导致刷新前端子路由会 404。
+# 用 _SPAStaticFiles 补齐这一层：底层 404 时统一回退到根 index.html，交给前端路由处理。
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
+class _SPAStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
+
+_web_dir = Path(os.getenv("WEB_DIR", "web"))
+if _web_dir.exists():
+    app.mount("/", _SPAStaticFiles(directory=str(_web_dir), html=True), name="spa")
+    logger.info(f"前端 SPA 已挂载: / -> {_web_dir.absolute()}")
+else:
+    logger.warning(f"前端目录不存在，跳过 SPA 挂载: {_web_dir.absolute()}")
 
 
 @app.exception_handler(Exception)
