@@ -224,6 +224,68 @@ async def test_browser_slot_renews_ttl_while_held(limiter, monkeypatch):
     assert await r.exists(key) == 0  # 退出 context 后应已释放
 
 
+@pytest.mark.anyio
+async def test_browser_slot_releases_even_if_renew_task_raises(limiter, monkeypatch):
+    """心跳任务内部抛未捕获异常时，body 的正常结果不应被掩盖，槽位仍应正常释放
+    （二轮复审 Finding A）。
+
+    修复前：`finally` 里 `await renew_task` 没有 try/except，renew_task 一旦
+    以异常结束就会把异常原样抛出，直接跳过下面的 release_browser_slot——一次
+    成功跑完的浏览器任务会被心跳的内部异常掩盖成整体失败。
+    """
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("心跳内部炸了")
+
+    monkeypatch.setattr(limiter, "_renew_slot", _boom)
+    monkeypatch.setattr(limiter, "_RENEW_INTERVAL_SECONDS", 0.05)
+
+    r = limiter._get_redis()
+    result = None
+    async with limiter.browser_slot(timeout=1) as token:
+        index_str, _, _ = token.partition(":")
+        key = f"xianyu:browser:slot:{index_str}"
+        await asyncio.sleep(0.2)  # 给心跳任务机会跑一次并抛异常退出
+        result = "body finished normally"
+
+    assert result == "body finished normally"  # body 的正常结果没被心跳异常掩盖
+    assert await r.exists(key) == 0  # 槽位仍被正确释放，没有因为心跳异常被跳过
+
+
+@pytest.mark.anyio
+async def test_browser_slot_releases_even_if_renew_task_cancelled(limiter, monkeypatch):
+    """renew_task 被外部直接 cancel()（例如未来接入 TaskGroup/优雅关闭批量取消
+    子任务）时，body 的正常结果不应被掩盖，槽位仍应正常释放（二轮复审 Finding A）。
+
+    CancelledError 在 Python 3.8+ 继承自 BaseException，普通 `except Exception`
+    抓不住，必须显式处理。
+    """
+
+    async def _hang(*_a, **_kw):
+        await asyncio.sleep(10)
+        return True
+
+    monkeypatch.setattr(limiter, "_renew_slot", _hang)
+    monkeypatch.setattr(limiter, "_RENEW_INTERVAL_SECONDS", 0.01)
+
+    r = limiter._get_redis()
+    result = None
+    async with limiter.browser_slot(timeout=1) as token:
+        index_str, _, _ = token.partition(":")
+        key = f"xianyu:browser:slot:{index_str}"
+        await asyncio.sleep(0.05)  # 让心跳任务先进入挂起的 _renew_slot 调用
+        renew_task = next(
+            t
+            for t in asyncio.all_tasks()
+            if not t.done() and t.get_coro().__name__ == "_renew_loop"
+        )
+        renew_task.cancel()  # 模拟外部批量取消
+        result = "body finished normally"
+
+    assert result == "body finished normally"
+    assert await r.exists(key) == 0
+
+
 @pytest.fixture()
 def anyio_backend():
     return "asyncio"

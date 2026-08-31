@@ -57,6 +57,21 @@
     （3 倍关系），允许连续错过 2 次心跳（例如短暂的 Redis 网络抖动）还有余量，
     第 3 次仍未续上才会被判定为泄漏并回收；相比旧的 600s，崩溃恢复延迟从最长
     10 分钟降到最长 90 秒。
+
+    残留风险（2026-08-31 二轮复审裁决：接受，不修复，仅记录）：acquire 阶段
+    （`SET NX`）是结构性不可能超额的数学事实——不依赖任何证明，因为可用 key
+    的数量本身就是上限。但“持有期间不丢失所有权”不是同一级别的保证：
+    `_renew_slot` 一旦发现槽位已经不属于自己，只会停止心跳、记一条
+    `[浏览器槽位重叠占用风险]` 日志，**不会**去中止仍在运行的 body（也做不到——
+    Playwright 的浏览器操作本身不可安全中断，真要做到需要下一个任务的 7 个
+    调用点全部配合改造，成本和收益不成比例，尤其是这个场景只会在 Redis
+    连续故障超过 90 秒（`_SLOT_TTL_SECONDS`）时触发，而那种时长的 Redis 故障
+    通常意味着数据库队列、缓存等其他子系统也已经一起失效，浏览器超额只是
+    并发故障之一）。也就是说：只要 Redis 连续不可用超过 90 秒，同一个 slot
+    索引上短暂出现两个真实 Chromium 实例在理论上仍然可能，这个窗口靠 TTL
+    压缩到 90 秒以内，而不是像 acquire 阶段那样被结构性杜绝。后续维护者不要
+    把“测试全绿”误读成“整个限流器在任何情况下都有数学级别的不超额保证”——
+    只有 acquire 阶段有，持有阶段是概率/时间窗口意义上的保证。
 """
 from __future__ import annotations
 
@@ -100,6 +115,13 @@ def _get_redis() -> aioredis.Redis:
             password=os.getenv("REDIS_PASSWORD") or None,
             db=int(os.getenv("REDIS_DB", "0")),
             decode_responses=True,
+            # 审查 Finding B：不配超时的话，一次卡住的 Redis 调用会让续期心跳
+            # 无限期挂起，进而在 browser_slot 退出时卡住 `await renew_task`，
+            # 连带阻塞 release。取值沿用 common/db/redis_client.py 里已有的
+            # 惯例（5s 读写 / 3s 连接），相对 30s 的续期间隔和 120s 的默认
+            # acquire 超时都足够宽松，不会把正常的网络抖动误判成超时。
+            socket_timeout=5,
+            socket_connect_timeout=3,
         )
     return _redis_client
 
@@ -233,6 +255,12 @@ async def browser_slot(timeout: float = 120.0):
     持有期间会启动一个后台心跳任务定期续期 TTL（见模块 docstring“TTL 与续期”）。
     退出时先置位 stop_event 并等待心跳任务自然结束，再释放槽位——保证不会有
     一次“迟到”的续期跟 release 并发抢同一个 key。
+
+    审查 Finding A：`await renew_task` 必须包一层 try/except。心跳只是辅助子
+    系统，它以异常（甚至 CancelledError——3.8+ 继承自 BaseException，普通
+    `except Exception` 抓不住）结束，不能连带跳过下面的 `release_browser_slot`：
+    否则一次成功跑完的浏览器任务会被心跳的内部异常掩盖成整体失败，槽位也会
+    白白等 TTL（至多 `_SLOT_TTL_SECONDS` 秒）才被动回收，而不是立刻主动释放。
     """
     token = await acquire_browser_slot(timeout=timeout)
     stop_event = asyncio.Event()
@@ -241,5 +269,10 @@ async def browser_slot(timeout: float = 120.0):
         yield token
     finally:
         stop_event.set()
-        await renew_task
+        try:
+            await renew_task
+        except (Exception, asyncio.CancelledError) as exc:
+            logger.warning(
+                f"浏览器槽位心跳任务异常结束（不影响本次结果，槽位仍会正常释放）: {exc}"
+            )
         await release_browser_slot(token)
