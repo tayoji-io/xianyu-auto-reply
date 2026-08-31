@@ -182,3 +182,73 @@ save ""
     mark("datadir")
 
 log("=== 骨架就绪 ===")
+
+# ---- 每次执行：拉取运行时产物（首次 clone，之后 pull 用于升级）----
+if (APP_DIR / ".git").exists():
+    run(f"cd {APP_DIR} && git pull --ff-only", check=False)
+else:
+    run(f"git clone --depth 1 {REPO} {APP_DIR}")
+log(f"代码版本: {(APP_DIR / 'VERSION').read_text().strip()}")
+
+# ---- 阶段 pydeps：Python 依赖 ----
+# 两个坑（Task 1 实测）：
+#   1. /opt/venv/lib/python3.11/site-packages 属主为 root，普通用户装不进去，必须 sudo
+#   2. -E 不可省 —— 丢失 VIRTUAL_ENV 后 uv 直接报错
+#   3. pip 是 uv pip 的壳，不接受 --break-system-packages
+if stage("pydeps"):
+    run(f"sudo -E pip install -r {APP_DIR}/requirements.txt")
+    mark("pydeps")
+
+# ---- 阶段 browser：Chromium ----
+# 项目用 patchright（反检测版），与沙盒预装的 playwright 1.58 浏览器共存不冲突；
+# 新增约 651MB，~/.cache/ms-playwright 总占用约 1.3GB
+if stage("browser"):
+    run("sudo -E /opt/venv/bin/python3 -m patchright install-deps chromium")
+    run("/opt/venv/bin/python3 -m patchright install chromium")
+    mark("browser")
+
+# ---- 每次执行：写 .env ----
+admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+if not admin_password:
+    fail("引导表单未提供 ADMIN_PASSWORD")
+
+(APP_DIR / ".env").write_text(f"""ENVIRONMENT=production
+TZ=Asia/Shanghai
+HOST=0.0.0.0
+BACKEND_WEB_PORT=8089
+WEBSOCKET_PORT=8090
+SCHEDULER_PORT=8091
+BACKEND_WEB_SERVICE_URL=http://localhost:8089
+WEBSOCKET_SERVICE_URL=http://localhost:8090
+SCHEDULER_SERVICE_URL=http://localhost:8091
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=xianyu
+MYSQL_PASSWORD={os.getenv('DB_PASSWORD', 'xianyu-local-only')}
+MYSQL_DATABASE=xianyu_data
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_DB=0
+STATIC_DIR={APP_DIR}/app/backend-web/static
+WEB_DIR={APP_DIR}/web
+BROWSER_HEADLESS=true
+MAX_CAPTCHA_CONCURRENT=1
+MAX_BROWSER_CONCURRENT=2
+LOG_LEVEL=INFO
+""", encoding="utf-8")
+log(".env 已写入")
+
+# ---- 阶段 supervisor：拉起全部进程 ----
+if stage("supervisor"):
+    run(f"sudo cp {APP_DIR}/supervisord.conf /etc/supervisord.conf")
+    mark("supervisor")
+
+# 每次执行：确保 supervisor 在运行
+running = run("pgrep -f supervisord || true", check=False).strip()
+if running:
+    run("sudo supervisorctl -c /etc/supervisord.conf reread", check=False)
+    run("sudo supervisorctl -c /etc/supervisord.conf update", check=False)
+    run("sudo supervisorctl -c /etc/supervisord.conf restart all", check=False)
+else:
+    log(f"启动 supervisord: {call_tool('exec', command='sudo supervisord -c /etc/supervisord.conf', detach=True)}")
+log("supervisor 已启动")
