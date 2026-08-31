@@ -44,18 +44,57 @@ def mark(name: str) -> None:
     log(f"阶段 {name} 完成")
 
 
-def run(cmd: str, check: bool = True) -> str:
+def run(cmd: str, check: bool = True, timeout: int = 1800) -> str:
+    """执行 shell 命令。返回 stdout+stderr 合并输出。
+
+    注意 shell=True：**绝不要把外部内容（密码、哈希、用户输入）直接拼进 cmd**，
+    bash 会展开其中的 $ 与反引号。SQL 一律走 run_sql()。
+    """
     log(f"$ {cmd}")
-    p = subprocess.run(
-        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=1800,
-    )
-    out = p.stdout or ""
+    try:
+        p = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout,
+        )
+        out, rc = p.stdout or "", p.returncode
+    except subprocess.TimeoutExpired as e:
+        # 超时同样要落盘已产生的输出 —— apt/pip 这类长命令最需要现场
+        raw = e.output or ""
+        out = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+        log(f"!! 超时（{timeout}s），已捕获输出：")
+        if out.strip():
+            log(out[-4000:])
+        raise
     if out.strip():
         log(out[-4000:])
-    if check and p.returncode != 0:
-        raise RuntimeError(f"命令失败（exit {p.returncode}）: {cmd}")
+    log(f"  exit={rc}")
+    if check and rc != 0:
+        raise RuntimeError(f"命令失败（exit {rc}）: {cmd}")
     return out
+
+
+def sql_quote(v: str) -> str:
+    """SQL 字符串字面量转义（反斜杠与单引号）。只用于值，不用于标识符。"""
+    return v.replace("\\", "\\\\").replace("'", "''")
+
+
+def run_sql(sql: str, db: str = "", raw: bool = False, check: bool = True) -> str:
+    """执行 SQL：写临时文件后重定向输入，**不把 SQL 拼进 shell 字符串**。
+
+    这不是洁癖 —— passlib 的 pbkdf2_sha256 哈希形如 $pbkdf2-sha256$29000$salt$hash，
+    直接拼进 shell 双引号会被 bash 展开成 "-sha2569000"，写进库的密码永远登录不上，
+    而 UPDATE 仍返回成功、日志毫无异常。
+    """
+    f = CONF_DIR / ".tmp.sql"
+    f.write_text(sql, encoding="utf-8")
+    try:
+        flags = "-N -B " if raw else ""
+        return run(
+            f"mariadb --socket={DATA_DIR}/mysql.sock -u root {flags}{db} < {f}",
+            check=check,
+        )
+    finally:
+        f.unlink(missing_ok=True)
 
 
 def fail(msg: str) -> None:
