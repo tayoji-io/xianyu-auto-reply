@@ -38,8 +38,16 @@ cp "$ROOT/requirements.txt" "$OUT/requirements.txt"
 
 echo "==> 编译 .pyc"
 for svc in "${SERVICES[@]}"; do
-  # -b 让 .pyc 与 .py 同名同目录（而非 __pycache__），便于直接运行
-  "$PY" -m compileall -b -q "$ROOT/$svc" -x '(node_modules|__pycache__|\.venv)'
+  # -b 让 .pyc 与 .py 同名同目录（而非 __pycache__），便于直接运行。
+  # -s "$ROOT" -p "app"：.pyc 里的 co_filename 默认写编译时的绝对路径
+  # （traceback 报错时会原样打印出来），一旦推到公开仓，每个订阅用户的
+  # 沙盒 traceback、以及直接 `strings *.pyc | grep Volumes` 都能看到
+  # 维护者本机的用户名/卷布局/仓库路径。-s 去掉 "$ROOT" 这段源码根前缀，
+  # -p 换成产物内的相对前缀 "app"，效果是 co_filename 从
+  # "/Volumes/.../xianyu-runjobs-port/common/xxx.py" 变成
+  # "app/common/xxx.py"——和产物里 .pyc 实际所在的相对路径一致，traceback
+  # 依然指向正确文件，只是不再暴露编译机的绝对路径。
+  "$PY" -m compileall -b -q -s "$ROOT" -p "app" "$ROOT/$svc" -x '(node_modules|__pycache__|\.venv)'
   mkdir -p "$OUT/app/$svc"
 
   # 打包清单 = 两部分合并：
