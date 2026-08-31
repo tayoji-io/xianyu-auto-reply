@@ -8,6 +8,8 @@ AI回复设置服务
 """
 from __future__ import annotations
 
+import os
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,16 +23,21 @@ from common.services.ai_provider_service import (
 )
 from common.models.xy_account import XYAccount
 
+# 平台（RunJobs）注入的模型网关；未注入时退回原有 dashscope 默认值
+_GATEWAY_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
+_GATEWAY_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
 DEFAULT_AI_SETTINGS = {
-    "ai_enabled": False,
+    # 有网关 key 时默认开启，用户无需自备模型 key
+    "ai_enabled": bool(_GATEWAY_API_KEY),
     "provider_type": DEFAULT_AI_PROVIDER_TYPE,
-    "model_name": "qwen-plus",
-    "api_key": "",
-    "base_url": DEFAULT_AI_BASE_URL,
+    "model_name": os.getenv("AI_MODEL", "").strip() or "qwen-plus",
+    "api_key": _GATEWAY_API_KEY,
+    "base_url": _GATEWAY_BASE_URL or DEFAULT_AI_BASE_URL,
     "max_discount_percent": 10,
     "max_discount_amount": 100,
     "max_bargain_rounds": 3,
-    "custom_prompts": "",
+    "custom_prompts": os.getenv("AI_PERSONA", ""),
     "ai_time_range_start": "",
     "ai_time_range_end": "",
 }
@@ -45,7 +52,11 @@ class AIReplySettingsService:
     def _extract_settings(self, account: XYAccount) -> dict:
         stored = (account.metadata_json or {}).get("ai_reply_settings") or {}
         payload = DEFAULT_AI_SETTINGS.copy()
-        payload.update({k: v for k, v in stored.items() if v is not None})
+        # 空字符串视同未设置（None），回落到默认值（含 RunJobs 网关 key/地址）。
+        # 历史/导入数据里常见 api_key、model_name 等字段被存成 ""（从未配置过），
+        # 若按 "" 字面值覆盖默认值，会把新的网关默认配置永久屏蔽掉。
+        # 数值(0)/布尔(False)与 "" 类型不同，不受影响，仍按字面值覆盖。
+        payload.update({k: v for k, v in stored.items() if v not in (None, "")})
         payload["ai_enabled"] = read_ai_enabled(stored)
         payload["max_discount_percent"] = int(payload.get("max_discount_percent", 10) or 0)
         payload["max_discount_amount"] = int(payload.get("max_discount_amount", 100) or 0)
