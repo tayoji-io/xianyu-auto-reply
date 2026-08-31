@@ -114,4 +114,60 @@ try:
 except ImportError:
     log("!! passlib 不可用 —— Task 11 的密码覆盖将失败，需改用 /opt/venv/bin/python3 子进程执行")
 # Task 9-12 的阶段将在此处依次追加
+
+# ---- 阶段 apt：系统依赖 ----
+if stage("apt"):
+    run("sudo apt-get update -qq")
+    # asyncmy 0.2.14 有预编译 wheel（Task 1 实测），无需编译工具链
+    run(
+        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+        "mariadb-server redis-server supervisor"
+    )
+    # 平台以容器方式运行，禁用发行版自带的服务管理，统一交给 supervisor
+    run("sudo systemctl disable mariadb redis-server 2>/dev/null || true", check=False)
+    run("sudo pkill -f mariadbd || true", check=False)
+    run("sudo pkill -f redis-server || true", check=False)
+    mark("apt")
+
+# ---- 阶段 datadir：数据目录与配置文件 ----
+if stage("datadir"):
+    mysql_dir = DATA_DIR / "mysql"
+    redis_dir = DATA_DIR / "redis"
+    mysql_dir.mkdir(parents=True, exist_ok=True)
+    redis_dir.mkdir(parents=True, exist_ok=True)
+
+    # 4G 内存下的保守参数（原 compose 为 300 连接 / 256M，此处下调）
+    (CONF_DIR / "my.cnf").write_text(f"""[mysqld]
+user=user
+datadir={mysql_dir}
+socket={DATA_DIR}/mysql.sock
+pid-file={DATA_DIR}/mysql.pid
+bind-address=127.0.0.1
+port=3306
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+default-time-zone='+08:00'
+innodb_buffer_pool_size=128M
+max_connections=50
+max_allowed_packet=64M
+skip-name-resolve
+
+[client]
+socket={DATA_DIR}/mysql.sock
+""", encoding="utf-8")
+
+    (CONF_DIR / "redis.conf").write_text(f"""bind 127.0.0.1
+port 6379
+dir {redis_dir}
+maxmemory 64mb
+maxmemory-policy allkeys-lru
+appendonly yes
+save ""
+""", encoding="utf-8")
+
+    # 初始化 mariadb 数据目录（幂等：已存在 mysql 系统库则跳过）
+    if not (mysql_dir / "mysql").exists():
+        run(f"mariadb-install-db --user=user --datadir={mysql_dir} --auth-root-authentication-method=normal")
+    mark("datadir")
+
 log("=== 骨架就绪 ===")
