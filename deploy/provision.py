@@ -329,3 +329,18 @@ if stage("adminpw"):
     )
     log("管理员密码已覆盖")
     mark("adminpw")
+
+# ---- 收尾：等待就绪并暴露端口 ----
+for i in range(60):
+    out = run("curl -s -o /dev/null -w '%{http_code}' http://localhost:8089/health", check=False).strip()
+    if out.endswith("200"):
+        log(f"backend-web 就绪（{i * 2}s）")
+        break
+    time.sleep(2)
+else:
+    fail("backend-web 在 120 秒内未就绪，检查 logs/backend-web.log")
+
+result = server_tool("create_port_preview", port=8089, label="闲鱼卖家后台")
+(WORKSPACE / "PREVIEW_URL.txt").write_text(str(result), encoding="utf-8")
+log(f"端口预览: {result}")
+print("闲鱼卖家已就绪，请用 admin 与你设置的密码登录。")
