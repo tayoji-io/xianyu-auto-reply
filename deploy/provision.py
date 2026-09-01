@@ -240,11 +240,15 @@ log(".env 已写入")
 if stage("dbinit"):
     db_password = os.getenv("DB_PASSWORD", "xianyu-local-only")
     # 必须用 run_sql：密码可能含 $ ` " 等字符，直接拼进 shell 字符串会被展开
+    # 注意授权主机：my.cnf 开启了 skip-name-resolve，'localhost' 只匹配 UNIX socket
+    # 连接，不会匹配 TCP 127.0.0.1（应用 .env 里 MYSQL_HOST=127.0.0.1，走 TCP）。
+    # 实测：只建 'xianyu'@'localhost' 时，应用连接报 1045 Access denied for
+    # user 'xianyu'@'127.0.0.1'，三个业务进程反复重启。故须为 '127.0.0.1' 建号。
     run_sql(
         "CREATE DATABASE IF NOT EXISTS xianyu_data "
         "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
-        f"CREATE USER IF NOT EXISTS 'xianyu'@'localhost' IDENTIFIED BY '{sql_quote(db_password)}';\n"
-        "GRANT ALL PRIVILEGES ON xianyu_data.* TO 'xianyu'@'localhost';\n"
+        f"CREATE USER IF NOT EXISTS 'xianyu'@'127.0.0.1' IDENTIFIED BY '{sql_quote(db_password)}';\n"
+        "GRANT ALL PRIVILEGES ON xianyu_data.* TO 'xianyu'@'127.0.0.1';\n"
         "FLUSH PRIVILEGES;"
     )
     mark("dbinit")
