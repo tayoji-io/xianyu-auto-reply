@@ -236,6 +236,19 @@ LOG_LEVEL=INFO
 """, encoding="utf-8")
 log(".env 已写入")
 
+# ---- 阶段 dbinit：建库与授权 ----
+if stage("dbinit"):
+    db_password = os.getenv("DB_PASSWORD", "xianyu-local-only")
+    # 必须用 run_sql：密码可能含 $ ` " 等字符，直接拼进 shell 字符串会被展开
+    run_sql(
+        "CREATE DATABASE IF NOT EXISTS xianyu_data "
+        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+        f"CREATE USER IF NOT EXISTS 'xianyu'@'localhost' IDENTIFIED BY '{sql_quote(db_password)}';\n"
+        "GRANT ALL PRIVILEGES ON xianyu_data.* TO 'xianyu'@'localhost';\n"
+        "FLUSH PRIVILEGES;"
+    )
+    mark("dbinit")
+
 # ---- 阶段 supervisor：拉起全部进程 ----
 if stage("supervisor"):
     run(f"sudo cp {APP_DIR}/supervisord.conf /etc/supervisord.conf")
@@ -275,3 +288,35 @@ if running:
 else:
     log(f"启动 supervisord: {call_tool('exec', command='sudo supervisord -c /etc/supervisord.conf', detach=True)}")
 log("supervisor 已启动")
+
+# ---- 每次执行：覆盖管理员密码 ----
+admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+if not admin_password:
+    fail("引导表单未提供 ADMIN_PASSWORD，无法覆盖出厂弱密码 admin123")
+
+# 等待应用完成建表，最长 120 秒
+for _ in range(60):
+    out = run_sql(
+        "SELECT COUNT(*) FROM information_schema.tables "
+        "WHERE table_schema='xianyu_data' AND table_name='xy_users';",
+        raw=True, check=False,
+    ).strip()
+    if out.endswith("1"):
+        break
+    time.sleep(2)
+else:
+    fail("等待应用建表超时（xy_users 未出现）")
+
+# passlib 由 requirements.txt 装入 /opt/venv，无需改 sys.path
+from passlib.context import CryptContext
+
+# 算法与 common/utils/security.py:22 保持一致，否则登录校验不通过
+pwd_hash = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto").hash(admin_password)
+# 关键：passlib 的哈希形如 $pbkdf2-sha256$29000$salt$hash，满是 $。
+# 若拼进 shell 双引号字符串，bash 会把 $pbkdf2 当变量展开，实测结果只剩 "-sha2569000"，
+# 导致写入库的哈希是乱码、用户永远登录不上，而 UPDATE 仍返回成功、日志毫无异常。
+run_sql(
+    f"UPDATE xy_users SET password_hash='{sql_quote(pwd_hash)}' WHERE username='admin';",
+    db="xianyu_data",
+)
+log("管理员密码已覆盖")
