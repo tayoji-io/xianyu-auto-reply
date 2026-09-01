@@ -1,6 +1,7 @@
 # provision.py — RunJobs 初始化脚本（粘贴到发布页「初始化脚本」）
 # 注意：create_port_preview 之前项目页不显示任何输出，故全部日志写文件。
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -353,9 +354,17 @@ for _port, _name in _PORTS.items():
 result = None
 try:
     _existing = str(server_tool("list_port_previews"))
-    if "8089" in _existing and "runjobs.dev" in _existing:
-        result = _existing
+    # 必须**提取 8089 那一条的 URL**，不能把整份列表当结果：
+    #  - 整份转储会让下面的 fail() 校验被无关记录"掩护"（列表里任意一条含
+    #    runjobs.dev 就放行，8089 那条即使缺失也检查不出来）
+    #  - PREVIEW_URL.txt 的契约是一条干净 URL，写入整份列表会破坏下游读取
+    # 正则要求 "Port 8089 →" 的完整模式，也顺带排除了 18089 / id 中含 8089 之类的子串误判
+    _m = re.search(r"Port\s+8089\s*[→>-]+\s*(https://[\w.-]+\.runjobs\.dev)", _existing)
+    if _m:
+        result = _m.group(1)
         log(f"端口预览已存在，复用：{result}")
+    else:
+        log("已有端口预览中未找到 8089，将新建")
 except Exception as exc:
     log(f"list_port_previews 不可用（{exc}），改为直接创建")
 
