@@ -331,16 +331,42 @@ if stage("adminpw"):
     mark("adminpw")
 
 # ---- 收尾：等待就绪并暴露端口 ----
-for i in range(60):
-    out = run("curl -s -o /dev/null -w '%{http_code}' http://localhost:8089/health", check=False).strip()
-    if out.endswith("200"):
-        log(f"backend-web 就绪（{i * 2}s）")
-        break
-    time.sleep(2)
-else:
-    fail("backend-web 在 120 秒内未就绪，检查 logs/backend-web.log")
+# 三个端口都等：只等 8089 的话，websocket/scheduler 没起来也会被判定"就绪"
+_PORTS = {8089: "backend-web", 8090: "websocket", 8091: "scheduler"}
+for _port, _name in _PORTS.items():
+    for i in range(60):
+        # --max-time 必须给：否则单次 curl 可能挂住，120 秒的承诺实际由 run() 的
+        # 1800 秒兜底，且那是未捕获的 TimeoutExpired 而非干净的 fail()
+        out = run(
+            f"curl -s --max-time 5 -o /dev/null -w '%{{http_code}}' http://localhost:{_port}/health",
+            check=False,
+        ).strip()
+        if out.endswith("200"):
+            log(f"{_name} 就绪（{i * 2}s）")
+            break
+        time.sleep(2)
+    else:
+        fail(f"{_name}（端口 {_port}）在 120 秒内未就绪，检查 logs/{_name}.log")
 
-result = server_tool("create_port_preview", port=8089, label="闲鱼卖家后台")
+# 端口预览幂等：每用户上限 10 个，且本段没有 stage() 守卫（UI 状态依赖每次都能拿到 URL），
+# 所以靠"先查再建"保证重复执行不会新增配额，而不是依赖平台是否去重（文档未承诺）。
+result = None
+try:
+    _existing = str(server_tool("list_port_previews"))
+    if "8089" in _existing and "runjobs.dev" in _existing:
+        result = _existing
+        log(f"端口预览已存在，复用：{result}")
+except Exception as exc:
+    log(f"list_port_previews 不可用（{exc}），改为直接创建")
+
+if result is None:
+    result = server_tool("create_port_preview", port=8089, label="闲鱼卖家后台")
+    log(f"端口预览: {result}")
+
+# 必须校验：若配额已满或调用失败时平台返回的是错误内容而非抛异常，
+# 不校验就会"UI 显示安装完成、PREVIEW_URL.txt 里却是一条错误信息"的静默失败
+if "runjobs.dev" not in str(result):
+    fail(f"端口预览创建失败或返回异常：{result}")
+
 (WORKSPACE / "PREVIEW_URL.txt").write_text(str(result), encoding="utf-8")
-log(f"端口预览: {result}")
 print("闲鱼卖家已就绪，请用 admin 与你设置的密码登录。")
