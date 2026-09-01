@@ -114,7 +114,7 @@ try:
     log("passlib 可用 ✓")
 except ImportError:
     log("!! passlib 不可用 —— Task 11 的密码覆盖将失败，需改用 /opt/venv/bin/python3 子进程执行")
-# Task 9-12 的阶段将在此处依次追加
+# 以下依次追加各阶段（Task 9-13）
 
 # ---- 阶段 apt：系统依赖 ----
 if stage("apt"):
@@ -238,6 +238,10 @@ LOG_LEVEL=INFO
 log(".env 已写入")
 
 # ---- 阶段 supervisor：拉起全部进程 ----
+# 注意：cp supervisord.conf 只在本阶段"首次"执行时跑一次（幂等由 stage()/mark()
+# 保证）。以后若要更新 supervisord.conf 的内容，必须先删掉 ~/workspace/.stage
+# 里的 "supervisor" 这一行，否则 stage("supervisor") 会静默跳过，改了配置也不会
+# 被拷贝生效。
 if stage("supervisor"):
     run(f"sudo cp {APP_DIR}/supervisord.conf /etc/supervisord.conf")
     mark("supervisor")
