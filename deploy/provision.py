@@ -285,13 +285,21 @@ log("supervisor 已启动")
 # 此前几轮之所以没暴露，是因为终端里手动启动过 mariadbd 且进程一直存活，遮蔽了
 # 这个顺序错误。三个 Python 服务在建库前会因缺库反复崩溃重启，这是预期的——
 # supervisor 的 autorestart 会在 dbinit 完成后让它们自行恢复。
+#
+# 判据必须是“查询真的返回了 1”，**不能用输出非空** ——
+# 连接失败时 `ERROR 2002 ... (111)` 同样是非空输出，会被误判为就绪
+# （实测复现过：日志里 ERROR 2002 之后紧跟着一行“mariadb 就绪（0s）”）。
+# `-N -B` 去掉表头与边框，正常输出就是干净的一行 "1"。
 _sock = DATA_DIR / "mysql.sock"
 for _i in range(60):
-    if _sock.exists() and run(
-        f"mariadb --socket={_sock} -u root -e 'SELECT 1;'", check=False
-    ).strip():
-        log(f"mariadb 就绪（{_i * 2}s）")
-        break
+    if _sock.exists():
+        _out = run(
+            f"mariadb --socket={_sock} -u root -N -B -e 'SELECT 1;'", check=False
+        ).strip()
+        _lines = [ln.strip() for ln in _out.splitlines() if ln.strip()]
+        if _lines and _lines[-1] == "1":
+            log(f"mariadb 就绪（{_i * 2}s）")
+            break
     time.sleep(2)
 else:
     fail(f"mariadb 在 120 秒内未就绪，检查 logs/mariadb.log 与 {_sock}")
