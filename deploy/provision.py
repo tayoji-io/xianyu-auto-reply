@@ -329,6 +329,22 @@ if stage("adminpw"):
         db="xianyu_data",
     )
     log("管理员密码已覆盖")
+
+    # 关闭登录页的「演示账号 admin/admin123 一键填充」提示。
+    # 该页面在公网完全公开：提示会暴露默认账号名，且万一某用户的 ADMIN_PASSWORD
+    # 未生效，它就是一组真实可用的凭据。用户需要时可在后台自行开启。
+    # xy_system_settings 是 key/value 表（PRIMARY KEY 为 `key`，`value` 列 NOT NULL，
+    # 已用 SHOW CREATE TABLE 核实）；该键在实测环境中已落库（值 'true'），
+    # 但不能假定所有沙盒都如此——用 ON DUPLICATE KEY UPDATE 而非 DELETE+INSERT，
+    # 无论该行是否已存在都能一次性正确写入，且不产生短暂的行缺失窗口。
+    run_sql(
+        "INSERT INTO xy_system_settings (`key`, `value`, `description`) "
+        "VALUES ('show_default_login_info', 'false', '登录页是否展示默认账号密码提示') "
+        "ON DUPLICATE KEY UPDATE `value`='false';",
+        db="xianyu_data",
+    )
+    log("已关闭登录页默认账号提示")
+
     mark("adminpw")
 
 # ---- 收尾：等待就绪并暴露端口 ----
