@@ -249,10 +249,25 @@ _pidfile = LOG_DIR / "supervisord.pid"
 running = False
 if _pidfile.exists():
     try:
-        os.kill(int(_pidfile.read_text().strip()), 0)   # 信号 0 只探测存活
-        running = True
-    except (ValueError, ProcessLookupError, PermissionError):
-        running = False   # pid 文件是陈旧残留
+        _pid = int(_pidfile.read_text().strip())
+    except (ValueError, OSError):
+        _pid = None
+    if _pid:
+        try:
+            os.kill(_pid, 0)          # 信号 0 只探测，不真的发信号
+            running = True
+        except PermissionError:
+            # EPERM 意味着进程**存在**、只是本进程无权给它发信号。
+            # supervisord 由 sudo 拉起、属主是 root，而本脚本以 user 运行，
+            # 这条分支才是常态。把它当作"未运行"会导致每次都重复拉起，
+            # 且 `supervisorctl restart all`（代码更新后刷新业务进程）永不可达。
+            running = True
+        except ProcessLookupError:
+            running = False           # ESRCH 才是真的不存在
+        if running:
+            # 防 pid 复用：pid 可能已被回收并分配给别的进程
+            _comm = Path(f"/proc/{_pid}/comm")
+            running = _comm.exists() and _comm.read_text().strip() == "supervisord"
 if running:
     run("sudo supervisorctl -c /etc/supervisord.conf reread", check=False)
     run("sudo supervisorctl -c /etc/supervisord.conf update", check=False)
