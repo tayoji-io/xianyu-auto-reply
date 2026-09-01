@@ -208,10 +208,8 @@ if stage("browser"):
     mark("browser")
 
 # ---- 每次执行：写 .env ----
-admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
-if not admin_password:
-    fail("引导表单未提供 ADMIN_PASSWORD")
-
+# 注意：ADMIN_PASSWORD 的校验不在这里 —— .env 不需要它，它只被 Task 11 的密码覆盖用到。
+# 放在这里会让整个部署流程卡在表单值缺失上，连 supervisor 都起不来。
 (APP_DIR / ".env").write_text(f"""ENVIRONMENT=production
 TZ=Asia/Shanghai
 HOST=0.0.0.0
@@ -244,14 +242,17 @@ if stage("supervisor"):
     mark("supervisor")
 
 # 每次执行：确保 supervisor 在运行
-# 注意：不能用 `pgrep -f supervisord`——沙盒基础镜像自身有一个 PID 1 的
-# supervisord（/usr/bin/python3 /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf，
-# 管理平台侧基础设施，与本应用无关），命令行里同样含有 "supervisord" 字样，
-# 会被 -f（按完整命令行匹配）恒定命中，导致 `running` 恒为真、
-# 我们自己这份 -c /etc/supervisord.conf 的 supervisord 永远不会被首次拉起。
-# 改用只匹配我们自己配置文件绝对路径的模式，platform 那份路径是
-# /etc/supervisor/conf.d/supervisord.conf，不含 "/etc/supervisord.conf" 子串，不会误命中。
-running = run("pgrep -f '/etc/supervisord.conf' || true", check=False).strip()
+# 不要用 `pgrep -f <配置路径>` 判断：run() 是 shell=True，产生的 `sh -c "pgrep -f ..."`
+# 自身命令行就含该字面量，会被 pgrep -f 恒定命中，判断永远为真、首次拉起分支永不执行。
+# （Task 9 的 pkill -f 是同一陷阱。）改为检测 supervisord 自己写的 pid 文件。
+_pidfile = LOG_DIR / "supervisord.pid"
+running = False
+if _pidfile.exists():
+    try:
+        os.kill(int(_pidfile.read_text().strip()), 0)   # 信号 0 只探测存活
+        running = True
+    except (ValueError, ProcessLookupError, PermissionError):
+        running = False   # pid 文件是陈旧残留
 if running:
     run("sudo supervisorctl -c /etc/supervisord.conf reread", check=False)
     run("sudo supervisorctl -c /etc/supervisord.conf update", check=False)
