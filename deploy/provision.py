@@ -293,34 +293,39 @@ else:
     log(f"启动 supervisord: {call_tool('exec', command='sudo supervisord -c /etc/supervisord.conf', detach=True)}")
 log("supervisor 已启动")
 
-# ---- 每次执行：覆盖管理员密码 ----
-admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
-if not admin_password:
-    fail("引导表单未提供 ADMIN_PASSWORD，无法覆盖出厂弱密码 admin123")
+# ---- 阶段 adminpw：覆盖出厂弱密码（**只在首次执行**）----
+# 不要改成"每次执行都覆盖"：表单值在容器生命周期内固定（只有「重置」才重新收集），
+# 每次覆盖会让管理员在应用内自行改的密码在下次容器重启后被悄悄改回表单原值，
+# 用户登录失败且找不到原因。表单提供的是**初始**密码，不是永久真相源。
+if stage("adminpw"):
+    admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+    if not admin_password:
+        fail("引导表单未提供 ADMIN_PASSWORD，无法覆盖出厂弱密码 admin123")
 
-# 等待应用完成建表，最长 120 秒
-for _ in range(60):
-    out = run_sql(
-        "SELECT COUNT(*) FROM information_schema.tables "
-        "WHERE table_schema='xianyu_data' AND table_name='xy_users';",
-        raw=True, check=False,
-    ).strip()
-    if out.endswith("1"):
-        break
-    time.sleep(2)
-else:
-    fail("等待应用建表超时（xy_users 未出现）")
+    # 等待应用完成建表，最长 120 秒
+    for _ in range(60):
+        out = run_sql(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema='xianyu_data' AND table_name='xy_users';",
+            raw=True, check=False,
+        ).strip()
+        if out.endswith("1"):
+            break
+        time.sleep(2)
+    else:
+        fail("等待应用建表超时（xy_users 未出现）")
 
-# passlib 由 requirements.txt 装入 /opt/venv，无需改 sys.path
-from passlib.context import CryptContext
+    # passlib 由 requirements.txt 装入 /opt/venv，无需改 sys.path
+    from passlib.context import CryptContext
 
-# 算法与 common/utils/security.py:22 保持一致，否则登录校验不通过
-pwd_hash = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto").hash(admin_password)
-# 关键：passlib 的哈希形如 $pbkdf2-sha256$29000$salt$hash，满是 $。
-# 若拼进 shell 双引号字符串，bash 会把 $pbkdf2 当变量展开，实测结果只剩 "-sha2569000"，
-# 导致写入库的哈希是乱码、用户永远登录不上，而 UPDATE 仍返回成功、日志毫无异常。
-run_sql(
-    f"UPDATE xy_users SET password_hash='{sql_quote(pwd_hash)}' WHERE username='admin';",
-    db="xianyu_data",
-)
-log("管理员密码已覆盖")
+    # 算法与 common/utils/security.py:22 保持一致，否则登录校验不通过
+    pwd_hash = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto").hash(admin_password)
+    # 关键：passlib 的哈希形如 $pbkdf2-sha256$29000$salt$hash，满是 $。
+    # 若拼进 shell 双引号字符串，bash 会把 $pbkdf2 当变量展开，实测结果只剩 "-sha2569000"，
+    # 导致写入库的哈希是乱码、用户永远登录不上，而 UPDATE 仍返回成功、日志毫无异常。
+    run_sql(
+        f"UPDATE xy_users SET password_hash='{sql_quote(pwd_hash)}' WHERE username='admin';",
+        db="xianyu_data",
+    )
+    log("管理员密码已覆盖")
+    mark("adminpw")
