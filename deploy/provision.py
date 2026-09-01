@@ -237,23 +237,6 @@ LOG_LEVEL=INFO
 """, encoding="utf-8")
 log(".env 已写入")
 
-# ---- 阶段 dbinit：建库与授权 ----
-if stage("dbinit"):
-    db_password = os.getenv("DB_PASSWORD", "xianyu-local-only")
-    # 必须用 run_sql：密码可能含 $ ` " 等字符，直接拼进 shell 字符串会被展开
-    # 注意授权主机：my.cnf 开启了 skip-name-resolve，'localhost' 只匹配 UNIX socket
-    # 连接，不会匹配 TCP 127.0.0.1（应用 .env 里 MYSQL_HOST=127.0.0.1，走 TCP）。
-    # 实测：只建 'xianyu'@'localhost' 时，应用连接报 1045 Access denied for
-    # user 'xianyu'@'127.0.0.1'，三个业务进程反复重启。故须为 '127.0.0.1' 建号。
-    run_sql(
-        "CREATE DATABASE IF NOT EXISTS xianyu_data "
-        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
-        f"CREATE USER IF NOT EXISTS 'xianyu'@'127.0.0.1' IDENTIFIED BY '{sql_quote(db_password)}';\n"
-        "GRANT ALL PRIVILEGES ON xianyu_data.* TO 'xianyu'@'127.0.0.1';\n"
-        "FLUSH PRIVILEGES;"
-    )
-    mark("dbinit")
-
 # ---- 阶段 supervisor：拉起全部进程 ----
 if stage("supervisor"):
     run(f"sudo cp {APP_DIR}/supervisord.conf /etc/supervisord.conf")
@@ -293,6 +276,42 @@ if running:
 else:
     log(f"启动 supervisord: {call_tool('exec', command='sudo supervisord -c /etc/supervisord.conf', detach=True)}")
 log("supervisor 已启动")
+
+# ---- 等待 mariadb socket 就绪（supervisor 刚拉起，需要几秒）----
+# 顺序至关重要：mariadbd 由 supervisor 拉起，dbinit 必须排在“确保 supervisor 在运行”
+# 之后，且要等 socket 真正就绪才能执行 SQL。冷重置实测证明了这一点：把 dbinit 放在
+# supervisor 之前，mariadb --socket=... 会直接报 ERROR 2002: Can't connect to local
+# server，未捕获异常导致整个脚本退出，后续 supervisor/adminpw/端口暴露全部不执行。
+# 此前几轮之所以没暴露，是因为终端里手动启动过 mariadbd 且进程一直存活，遮蔽了
+# 这个顺序错误。三个 Python 服务在建库前会因缺库反复崩溃重启，这是预期的——
+# supervisor 的 autorestart 会在 dbinit 完成后让它们自行恢复。
+_sock = DATA_DIR / "mysql.sock"
+for _i in range(60):
+    if _sock.exists() and run(
+        f"mariadb --socket={_sock} -u root -e 'SELECT 1;'", check=False
+    ).strip():
+        log(f"mariadb 就绪（{_i * 2}s）")
+        break
+    time.sleep(2)
+else:
+    fail(f"mariadb 在 120 秒内未就绪，检查 logs/mariadb.log 与 {_sock}")
+
+# ---- 阶段 dbinit：建库与授权 ----
+if stage("dbinit"):
+    db_password = os.getenv("DB_PASSWORD", "xianyu-local-only")
+    # 必须用 run_sql：密码可能含 $ ` " 等字符，直接拼进 shell 字符串会被展开
+    # 注意授权主机：my.cnf 开启了 skip-name-resolve，'localhost' 只匹配 UNIX socket
+    # 连接，不会匹配 TCP 127.0.0.1（应用 .env 里 MYSQL_HOST=127.0.0.1，走 TCP）。
+    # 实测：只建 'xianyu'@'localhost' 时，应用连接报 1045 Access denied for
+    # user 'xianyu'@'127.0.0.1'，三个业务进程反复重启。故须为 '127.0.0.1' 建号。
+    run_sql(
+        "CREATE DATABASE IF NOT EXISTS xianyu_data "
+        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+        f"CREATE USER IF NOT EXISTS 'xianyu'@'127.0.0.1' IDENTIFIED BY '{sql_quote(db_password)}';\n"
+        "GRANT ALL PRIVILEGES ON xianyu_data.* TO 'xianyu'@'127.0.0.1';\n"
+        "FLUSH PRIVILEGES;"
+    )
+    mark("dbinit")
 
 # ---- 阶段 adminpw：覆盖出厂弱密码（**只在首次执行**）----
 # 不要改成"每次执行都覆盖"：表单值在容器生命周期内固定（只有「重置」才重新收集），
